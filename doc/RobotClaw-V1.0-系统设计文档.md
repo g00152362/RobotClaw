@@ -312,7 +312,7 @@ Skill开发
 | **SOP Compiler** | 自然语言SOP编译为Skill DAG | Python + LLM API |
 | **Task Scheduler** | DAG实例化、参数注入、任务下发 | Python + gRPC |
 | **Memory Store** | 三层记忆存储与查询 | SQLite(Phase 1) → PostgreSQL+PostGIS(Phase 3+) |
-| **Practice Store** | 执行实践记录存储 | 时序数据库(TimescaleDB) |
+| **Practice Store** | 执行实践记录存储 | SQLite(Phase 1) → TimescaleDB(Phase 2+) |
 | **Skill Registry** | Skill注册、版本管理、能力声明 | Python + SQLite/PostgreSQL |
 | **Provider Registry** | LLM/VLM模型注册与路由 | Python |
 | **Audit Service** | 行为审计日志 | Append-only存储 + 哈希链 |
@@ -413,19 +413,23 @@ RobotClaw Runtime on Jetson AGX Orin
 **推荐迁移路径：**
 
 ```
-Phase 1 (Month 1-4):
+Phase 1 (Month 1-2): MVP验证
   Jetson AGX Orin — 全链路开发验证，建立性能基线
 
-Phase 2 (Month 5-6):
+Phase 2 (Month 3-4): 引擎完善 + 国产芯片启动
+  Jetson AGX Orin（主） + 启动国产芯片适配
   昇腾310P/BM1684X — 首个国产芯片适配
-  ├── 目标：核心模型（检测+ASR+异常识别）在国产芯片上跑通
+  ├── 目标：核心模型（检测+ASR）在国产芯片上跑通
   ├── 方法：ONNX → 国产框架转换（CANN/SAIL），精度对齐
-  └── 验证：与Jetson基线对比推理延迟和精度
+  └── 验证：与Jetson基线对比推理延迟和精度，精度损失<2%
 
-Phase 3 (Month 7+):
-  昇腾910B/寒武纪MLU — 高算力国产平台
+Phase 3 (Month 5-6): 真机验证 + 国产芯片全适配
+  Jetson AGX Orin（Design Partner验证） + 国产芯片（并行验证）
   ├── 目标：全部边缘模型（含VLM）在国产芯片上运行
-  └── 验证：端到端巡检任务性能达到Jetson 90%+
+  └── 验证：端到端性能达到Jetson基线90%+
+
+Phase 4 (Month 7-9): 产品化
+  国产芯片为主要交付平台，Jetson保留为开发/高端选项
 ```
 
 #### 2.4.3 硬件抽象层（HAL）设计
@@ -628,6 +632,12 @@ service TaskControl {
 
   // 人工接管（双向 streaming，持续指令流）
   rpc HumanTakeover(stream ControlCommand) returns (stream RobotFeedback);
+
+  // 接管请求（远端 → 机器人端，请求获取控制权）
+  rpc RequestTakeover(TakeoverRequest) returns (TakeoverAck);
+
+  // 归还控制权（远端 → 机器人端，操作员归还控制权）
+  rpc HandbackControl(HandbackRequest) returns (HandbackAck);
 }
 
 // 数据通道服务（替代MQTT，统一使用gRPC streaming）
@@ -1500,6 +1510,8 @@ SOP自然语言文本
 最终Skill DAG → 写入Task Memory缓存
 ```
 
+> **Phase 1审核UI与Dashboard的关系：** 需求U1.5（人工审核UI，P0）在Phase 1以**独立轻量Web页面**实现，仅包含SOP原文↔DAG映射对照、低置信度高亮、确认/修正功能，不依赖完整Dashboard。Phase 2 Dashboard（E3.*，P1）上线后，审核UI作为Dashboard的"SOP编译"子模块集成，共享认证和布局框架。
+
 #### 4.2.2 LLM Prompt策略
 
 **结构化输出约束：**
@@ -1949,7 +1961,7 @@ dag:
 
 | 记忆层 | 优化内容 | 效果 |
 |--------|---------|------|
-| **Task Memory** | 缓存该SOP的编译DAG | 第2次起编译耗时0ms |
+| **Task Memory** | 缓存该SOP的编译DAG | 相同SOP第2次起编译耗时0ms（缓存命中）；SOP修改后自动重新编译（3-5秒） |
 | **Execution Memory** | 记录各路段最优速度 | 药房→301最优路径从3min降至2min |
 | | 记录等待开门平均时长 | 自动调整timeout从60s→35s |
 | | 记录药箱力传感器最优阈值 | 降低误判率 |
@@ -2040,6 +2052,946 @@ skill:
 | 门把手定位精度 | ±2cm | 视觉+力反馈联合定位 |
 | 开门超时 | 15s | 超时未打开则触发恢复策略 |
 
+#### 4.3.9 表计读数识别Skill设计（read_meter）— Skill详细定义范例
+
+电力巡检场景的核心感知Skill。机器人需要对准变电站表计（电压表、电流表、功率因数表等），完成拍照、识别、结构化输出。本节作为**Skill详细定义的标准范例**，后续所有Skill应参照此结构编写。
+
+##### 一、Skill接口定义
+
+```yaml
+skill:
+  name: "read_meter"
+  version: "1.0.0"
+  category: "perception"
+  description: "识别变电站仪表盘读数，输出结构化数值。支持数字表、指针表、多联表。"
+
+  # ── 能力声明（供SOP Compiler匹配） ──
+  capabilities:
+    tags: ["表计识别", "读数", "OCR", "仪表盘", "电力巡检"]
+    applicable_robots: ["unitree-go2", "unitree-g1"]
+    environment: ["indoor", "outdoor"]
+
+  # ── 硬件能力需求 ──
+  required_capabilities:
+    - type: "perception.vision"
+      sensor_type: "rgb_camera"
+      min_resolution: [1920, 1080]       # 表计数字需要足够分辨率
+    - type: "perception.localization"    # 定位到表计正前方
+    - type: "locomotion.walking"
+      optional: true                     # 固定臂机器人无需移动
+
+  # ── 推理能力需求 ──
+  inference_requirements:
+    - name: "meter_detection"
+      type: "detector"
+      description: "从场景图像中检测表计区域（bounding box）"
+      preferred_deployment: "edge"
+      max_latency_ms: 50
+      input: "rgb_image"
+      output: "bounding_boxes[{class: meter_type, bbox, confidence}]"
+      model_candidates: ["yolov8-meter-v1", "rt-detr-meter-v1"]
+
+    - name: "digit_recognition"
+      type: "ocr"
+      description: "识别数字表的LCD/LED数字读数"
+      preferred_deployment: "edge"
+      max_latency_ms: 80
+      input: "cropped_meter_image"
+      output: "{value: float, unit: string, confidence: float}"
+      model_candidates: ["paddleocr-meter-v1"]
+
+    - name: "pointer_recognition"
+      type: "keypoint_regression"
+      description: "识别指针表的刻度盘和指针角度，换算为读数"
+      preferred_deployment: "edge"
+      max_latency_ms: 100
+      input: "cropped_meter_image + scale_metadata"
+      output: "{value: float, unit: string, pointer_angle_deg: float, confidence: float}"
+      model_candidates: ["pointer-gauge-reader-v1"]
+
+    - name: "vlm_fallback"
+      type: "vlm"
+      description: "当专用模型识别失败或置信度低时，用VLM兜底识别"
+      preferred_deployment: "remote"
+      max_latency_ms: 3000
+      input: "cropped_meter_image + prompt"
+      output: "{value: float, unit: string, confidence: float, reasoning: string}"
+      optional: true
+      phase: "P1"
+
+  # ── 输入参数 ──
+  inputs:
+    - name: "meter_location"
+      type: "Pose3D"
+      required: true
+      description: "表计所在位置（来自巡检点位列表或空间记忆）"
+
+    - name: "meter_id"
+      type: "string"
+      required: true
+      description: "表计唯一标识（如 substation-A3/panel-2/voltmeter-1）"
+
+    - name: "meter_type"
+      type: "enum"
+      values: ["digital", "pointer", "auto"]
+      default: "auto"
+      description: "表计类型。auto模式下由视觉自动判定"
+
+    - name: "expected_range"
+      type: "object"
+      required: false
+      schema: {min: "float", max: "float", unit: "string"}
+      default: null
+      description: "期望读数范围，用于异常判定。如 {min: 215, max: 245, unit: 'V'}"
+
+    - name: "capture_config"
+      type: "object"
+      required: false
+      schema: {num_captures: "int", angle_adjustments: "list[float]"}
+      default: {num_captures: 3, angle_adjustments: [-5, 0, 5]}
+      description: "拍摄配置：拍摄张数和角度微调（度），多角度拍摄取最优"
+
+  # ── 输出参数 ──
+  outputs:
+    - name: "reading"
+      type: "MeterReading"
+      schema:
+        meter_id: "string"
+        meter_type: "enum[digital, pointer]"
+        value: "float"
+        unit: "string"
+        confidence: "float"           # 0.0-1.0，识别置信度
+        timestamp: "datetime"
+        raw_image_path: "string"      # 原始拍摄图像存储路径
+        cropped_image_path: "string"  # 裁剪后的表计图像路径
+        recognition_method: "enum[edge_ocr, edge_keypoint, vlm_fallback, manual_review]"
+
+    - name: "anomaly_flag"
+      type: "object"
+      schema:
+        is_anomalous: "bool"
+        anomaly_type: "enum[out_of_range, unreadable, damaged, null]"
+        detail: "string"
+
+  # ── 前置条件 ──
+  preconditions:
+    - "robot.position.distance_to(meter_location) < 1.5"
+    - "capability('perception.vision').status == 'ready'"
+    - "capability('perception.vision').sensor('rgb_camera').resolution >= [1920, 1080]"
+
+  # ── 后置条件 ──
+  postconditions:
+    - "outputs.reading.value is not None or outputs.anomaly_flag.is_anomalous == true"
+    - "outputs.reading.confidence >= 0.0"
+    - "outputs.reading.raw_image_path is not None"
+
+  # ── 失败模式与恢复策略 ──
+  failure_modes:
+    - code: "METER_NOT_FOUND"
+      severity: "recoverable"
+      description: "视觉检测未在画面中找到任何表计"
+      possible_causes: ["机器人未对准表计", "表计被遮挡", "光照不足"]
+      recovery: "invoke_skill('navigate_to_waypoint', {target: meter_location, precision: 'high'})"
+      max_recovery_attempts: 2
+
+    - code: "LOW_CONFIDENCE"
+      severity: "recoverable"
+      description: "读数识别置信度低于阈值（<0.7）"
+      possible_causes: ["表盘模糊", "反光", "指针抖动", "非标准表盘"]
+      recovery: "retry_with_adjustment"
+      recovery_detail: "调整拍摄角度（±10°）和距离（±0.2m），重新拍摄识别，最多2次"
+      max_recovery_attempts: 2
+
+    - code: "METER_DAMAGED"
+      severity: "unrecoverable"
+      description: "检测到表计物理损坏（表盘破裂、指针缺失、显示黑屏）"
+      possible_causes: ["设备老化", "外力损坏"]
+      recovery: "escalate_to_human({reason: '表计疑似损坏', evidence: raw_image_path})"
+
+    - code: "RECOGNITION_TIMEOUT"
+      severity: "recoverable"
+      description: "推理超时（边缘模型未在规定时间内返回结果）"
+      possible_causes: ["GPU过载", "模型未加载", "图像尺寸异常"]
+      recovery: "retry_after(3, max=2)"
+
+    - code: "CAMERA_ERROR"
+      severity: "recoverable"
+      description: "相机拍摄失败（返回空帧或错误码）"
+      possible_causes: ["相机未就绪", "驱动异常"]
+      recovery: "retry_after(2, max=3)"
+
+    - code: "OUT_OF_RANGE_READING"
+      severity: "recoverable"
+      description: "读数在expected_range之外"
+      possible_causes: ["设备真实异常", "识别错误"]
+      recovery: "retry_once_then_flag"
+      recovery_detail: "重新拍摄识别1次；仍超范围则标记anomaly_flag并继续（不阻塞巡检）"
+
+  timeout_s: 45
+  retry_policy:
+    max_retries: 3
+    backoff: "fixed"
+    backoff_delay_s: 3
+```
+
+##### 二、具体操作步骤
+
+每个步骤包含**动作描述**、**判断条件**和**异常分支**：
+
+```yaml
+execution_steps:
+
+  step_1_approach:
+    action: "导航至表计正前方最佳拍摄位置"
+    detail: |
+      调用navigate_to_waypoint到达meter_location。
+      到达后微调位姿：正对表盘中心，距离0.8-1.2m（指针表近距离拍摄清晰度更高）。
+    success_criteria:
+      - "robot.position.distance_to(meter_location) < 1.2"
+      - "robot.heading面向表盘（偏差<15°）"
+    failure_branch:
+      condition: "导航失败或无法到达指定距离"
+      action: "记录当前最近可达位置，尝试在该位置拍摄（降级模式）"
+
+  step_2_capture:
+    action: "多角度拍摄表计图像"
+    detail: |
+      按capture_config配置拍摄多张图像。
+      默认拍摄3张：正面(0°)、左偏(-5°)、右偏(+5°)。
+      每张拍摄前等待50ms确保相机稳定（消除运动模糊）。
+      记录每张图像的拍摄参数（位姿、角度、曝光）。
+    success_criteria:
+      - "至少获得1张有效图像（非黑帧、非过曝）"
+      - "图像分辨率 >= 1920x1080"
+    failure_branch:
+      condition: "全部拍摄返回无效帧"
+      action: "触发CAMERA_ERROR失败模式"
+
+  step_3_detect:
+    action: "检测表计区域"
+    detail: |
+      对每张图像运行meter_detection模型。
+      输出bounding box + 表计类型分类（digital/pointer）。
+      选择检测置信度最高的一张作为主图像。
+      如果meter_type输入为"auto"，以检测结果的类型分类为准。
+    success_criteria:
+      - "至少1张图像检测到表计（detection_confidence >= 0.8）"
+      - "bounding box面积占图像面积的5%-80%（排除误检和过近/过远）"
+    failure_branch:
+      condition: "所有图像均未检测到表计"
+      action: "触发METER_NOT_FOUND失败模式"
+    judgment_rules:
+      bbox_too_small: "bbox面积 < 图像面积5% → 距离过远，建议前进0.3m重试"
+      bbox_too_large: "bbox面积 > 图像面积80% → 距离过近，建议后退0.3m重试"
+      multiple_meters: "检测到多个表计 → 按meter_id匹配空间记忆中的位置，选最近的"
+
+  step_4_crop_and_preprocess:
+    action: "裁剪表计区域并预处理"
+    detail: |
+      按bounding box裁剪表计区域，外扩10%边距。
+      预处理流水线：
+        1. 灰度化（指针表）或保持彩色（数字表）
+        2. 自适应直方图均衡（CLAHE，应对光照不均）
+        3. 透视校正（如果检测到倾斜>5°）
+        4. 锐化（USM锐化，增强数字/刻度边缘）
+      保存裁剪后图像到cropped_image_path。
+    success_criteria:
+      - "裁剪图像尺寸 >= 200x200像素"
+      - "预处理后图像对比度评分（Michelson对比度）>= 0.3"
+
+  step_5_recognize:
+    action: "识别读数"
+    detail: |
+      根据step_3判定的表计类型，选择对应识别流水线：
+
+      【数字表流水线】
+        1. 运行digit_recognition模型（OCR）
+        2. 输出：数值 + 单位 + 置信度
+        3. 如果表盘有多行显示，识别所有行，选择与meter_id对应的量
+
+      【指针表流水线】
+        1. 运行pointer_recognition模型（关键点回归）
+        2. 检测：圆心位置、指针末端位置、刻度起止标记
+        3. 计算指针角度 → 映射到刻度范围 → 输出读数值
+        4. 如果有空间记忆中该表计的刻度范围（scale_min/scale_max），直接使用
+        5. 否则尝试OCR识别刻度标注数字
+
+      两种流水线均输出：{value, unit, confidence}
+    success_criteria:
+      - "confidence >= 0.7（高置信度阈值）"
+    failure_branch:
+      condition: "confidence < 0.7"
+      action: "触发LOW_CONFIDENCE失败模式 → retry_with_adjustment"
+
+  step_6_validate:
+    action: "验证读数合理性"
+    detail: |
+      对识别结果进行多维度校验：
+    judgment_rules:
+      range_check: |
+        如果提供了expected_range：
+          value在[min, max]内 → 正常
+          value超出范围但偏差<20% → 标记"注意"，继续
+          value超出范围且偏差>=20% → 触发OUT_OF_RANGE_READING，重新识别1次确认
+      physical_sanity: |
+        电压表：0-500V范围外 → 异常
+        电流表：负值 → 异常
+        功率因数：0-1范围外 → 异常
+        温度表：-40~200°C范围外 → 异常
+      history_compare: |
+        查询Spatial Memory中该meter_id的上一次读数：
+          变化<30% → 合理
+          变化>=30%且<100% → 标记"显著变化"，记录但不阻塞
+          变化>=100% → 可能是识别错误，重新识别1次
+      consistency_check: |
+        同一表盘多行读数的物理一致性检查：
+          如 电压×电流 应≈功率（偏差<15%）
+          不一致时标记但不阻塞，供报告备注
+
+  step_7_output:
+    action: "组装输出并记录"
+    detail: |
+      填充MeterReading结构体和anomaly_flag。
+      将原始图像和裁剪图像写入本地存储（供审计和报告生成使用）。
+      如果有空间记忆，更新该meter_id的最新读数和参考图像。
+    success_criteria:
+      - "reading和anomaly_flag全部字段已填充"
+      - "图像文件已成功写入"
+```
+
+##### 三、判断标准与规则汇总
+
+| 判断项 | 通过标准 | 不通过处理 |
+|--------|---------|-----------|
+| 表计检测置信度 | ≥ 0.8 | < 0.8 → 调整角度/距离重拍 |
+| 读数识别置信度 | ≥ 0.7 | 0.5-0.7 → 重拍2次取最高；< 0.5 → VLM兜底或标记人工复核 |
+| bbox面积占比 | 5%-80% | < 5% 前进，> 80% 后退 |
+| 读数范围校验 | 在expected_range内 | 偏差< 20% 标记注意；≥ 20% 重新识别确认 |
+| 历史变化幅度 | < 30% | 30%-100% 标记显著变化；≥ 100% 重新识别 |
+| 图像有效性 | 非黑帧、非过曝、分辨率达标 | 重拍，3次无效 → CAMERA_ERROR |
+| 预处理对比度 | Michelson ≥ 0.3 | < 0.3 → 曝光补偿后重拍 |
+
+##### 四、场景案例
+
+**案例1：数字电压表（正常路径）**
+
+```
+输入：
+  meter_location: {x: 15.2, y: 8.7, z: 1.4}
+  meter_id: "substation-A3/panel-2/voltmeter-1"
+  meter_type: "digital"
+  expected_range: {min: 215, max: 245, unit: "V"}
+
+执行过程：
+  step_1: 导航至(15.2, 8.7)，正对表盘，距离0.9m ✓
+  step_2: 拍摄3张（-5°, 0°, +5°），均有效 ✓
+  step_3: 0°正面图检测置信度0.95（最高），digital类型 ✓
+  step_4: 裁剪+CLAHE+锐化，对比度0.72 ✓
+  step_5: OCR识别 → 228.5，置信度0.93 ✓
+  step_6: 228.5在[215,245]内 ✓，与上次读数226.1变化1.1% ✓
+  step_7: 输出MeterReading，anomaly_flag.is_anomalous = false
+
+输出：
+  reading:
+    meter_id: "substation-A3/panel-2/voltmeter-1"
+    meter_type: "digital"
+    value: 228.5
+    unit: "V"
+    confidence: 0.93
+    recognition_method: "edge_ocr"
+  anomaly_flag:
+    is_anomalous: false
+    anomaly_type: null
+```
+
+**案例2：指针电流表（低置信度恢复）**
+
+```
+输入：
+  meter_id: "substation-A3/panel-2/ammeter-1"
+  meter_type: "pointer"
+  expected_range: {min: 80, max: 120, unit: "A"}
+
+执行过程：
+  step_1-4: 正常完成 ✓
+  step_5: 首次指针识别 → 95.2A，置信度0.58 ✗（< 0.7）
+          触发LOW_CONFIDENCE → retry_with_adjustment
+          调整角度+10°重拍 → 重新识别 → 96.1A，置信度0.82 ✓
+  step_6: 96.1在[80,120]内 ✓
+  step_7: 输出MeterReading，confidence=0.82
+
+输出：
+  reading:
+    value: 96.1
+    confidence: 0.82
+    recognition_method: "edge_keypoint"
+  anomaly_flag:
+    is_anomalous: false
+```
+
+**案例3：表计损坏（不可恢复）**
+
+```
+输入：
+  meter_id: "substation-B1/panel-1/voltmeter-3"
+  meter_type: "auto"
+
+执行过程：
+  step_1-2: 正常完成 ✓
+  step_3: 检测到表计区域，但分类为"damaged"（表盘破裂） ✗
+          触发METER_DAMAGED → escalate_to_human
+  step_7: 输出reading.value=null，标记异常
+
+输出：
+  reading:
+    value: null
+    confidence: 0.0
+    recognition_method: "manual_review"
+    raw_image_path: "/data/captures/run-001/meter-B1-P1-V3.jpg"
+  anomaly_flag:
+    is_anomalous: true
+    anomaly_type: "damaged"
+    detail: "表盘玻璃破裂，无法读取。已上报人工复核。"
+```
+
+**案例4：读数超范围（重试确认后标记异常）**
+
+```
+输入：
+  meter_id: "substation-A3/panel-2/voltmeter-2"
+  expected_range: {min: 215, max: 245, unit: "V"}
+
+执行过程：
+  step_1-5: 正常完成，读数 = 189.3V，置信度0.91 ✓
+  step_6: 189.3不在[215,245]内，偏差12.1%（< 20%）→ 标记"注意"
+          但与上次读数232.0相比变化18.4%（< 30%）→ 可能是真实下降
+          OUT_OF_RANGE但不触发重新识别（偏差<20%）
+  step_7: 输出reading，标记anomaly
+
+输出：
+  reading:
+    value: 189.3
+    confidence: 0.91
+  anomaly_flag:
+    is_anomalous: true
+    anomaly_type: "out_of_range"
+    detail: "读数189.3V，低于期望下限215V，偏差12.1%。置信度0.91，识别可信。建议检查供电设备。"
+```
+
+##### 五、边界情况处理
+
+| 边界情况 | 处理策略 |
+|----------|---------|
+| **强光直射/反光** | step_2多角度拍摄覆盖；step_4 CLAHE增强；若所有角度均过曝，等待云遮挡或标记人工复核 |
+| **夜间/低光照** | 如机器人有补光灯则开启；否则延长曝光时间（需评估运动模糊）；实在不可用则标记人工复核 |
+| **表盘积灰/污渍** | 识别为低置信度 → 多角度重试 → VLM兜底 → 仍不可读则保留原图标记 |
+| **指针在两个刻度之间** | pointer_recognition模型输出连续角度值，自然处理插值；刻度映射需要精确的scale_min/max |
+| **多联表（一个面板多个表）** | step_3检测出多个bbox → 按meter_id与空间记忆中的位置匹配 → 逐个执行step_4-6 |
+| **LCD段码缺划** | OCR可能误读（如"7"缺一划变"1"） → 历史对比发现突变 → 重新识别并标记不确定 |
+| **表盘被部分遮挡** | bbox检测成功但OCR/指针识别失败 → 调整位置重拍 → 仍被挡则标记人工复核 |
+| **非标准表计（不在训练集中）** | 专用模型识别失败 → VLM兜底（Phase 2）→ 均失败则标记人工复核 + 保存图像用于模型迭代 |
+| **表计未通电（显示空白）** | 数字表检测到黑屏 → 标记anomaly_type="unreadable"，detail="表计未通电或LCD故障" |
+| **机器人震动导致图像模糊** | step_2等待50ms稳定 → 若仍模糊（拉普拉斯方差<100），等待200ms后重拍 |
+| **expected_range未提供** | 跳过range_check；仅做physical_sanity和history_compare |
+
+##### 六、执行标准与检查清单
+
+**Skill开发者在实现read_meter时必须逐项确认：**
+
+```yaml
+checklist:
+  # ── 接口合规 ──
+  interface:
+    - id: "C01"
+      item: "输入输出类型与接口定义完全匹配"
+      验证方法: "单元测试：构造合法/非法输入，验证类型校验通过/拒绝"
+
+    - id: "C02"
+      item: "所有required输入缺失时抛出明确错误（不是segfault或空指针）"
+      验证方法: "单元测试：逐个移除required字段，验证错误信息可读"
+
+    - id: "C03"
+      item: "optional输入缺失时使用default值正常执行"
+      验证方法: "单元测试：不传capture_config和expected_range，验证默认行为"
+
+  # ── 前置/后置条件 ──
+  conditions:
+    - id: "C04"
+      item: "前置条件全部校验，不满足时返回明确的PRECONDITION_FAILED（不进入执行）"
+      验证方法: "集成测试：机器人距离>1.5m时调用，验证直接返回失败而非尝试拍照"
+
+    - id: "C05"
+      item: "后置条件全部校验，不满足时触发对应failure_mode"
+      验证方法: "集成测试：模拟相机返回空帧，验证postcondition检测到并触发CAMERA_ERROR"
+
+  # ── 失败模式覆盖 ──
+  failure_coverage:
+    - id: "C06"
+      item: "每种failure_mode至少有1个触发测试用例"
+      验证方法: "单元/集成测试矩阵：METER_NOT_FOUND / LOW_CONFIDENCE / METER_DAMAGED / RECOGNITION_TIMEOUT / CAMERA_ERROR / OUT_OF_RANGE_READING 各1case"
+
+    - id: "C07"
+      item: "恢复策略在max_recovery_attempts内终止（不无限重试）"
+      验证方法: "测试：模拟持续失败，验证重试次数不超过max，最终escalate或标记"
+
+    - id: "C08"
+      item: "unrecoverable失败直接上报人工，不尝试恢复"
+      验证方法: "测试：触发METER_DAMAGED，验证直接调用escalate_to_human"
+
+  # ── 性能指标 ──
+  performance:
+    - id: "C09"
+      item: "端到端执行时间 ≤ timeout_s（45秒），正常路径 ≤ 15秒"
+      验证方法: "性能测试：10次正常路径执行，P95 < 15s"
+
+    - id: "C10"
+      item: "边缘模型推理延迟达标（检测<50ms, OCR<80ms, 指针<100ms）"
+      验证方法: "基准测试：Jetson AGX Orin上100次推理，P99达标"
+
+    - id: "C11"
+      item: "数字表读数准确率 ≥ 95%（标准光照条件下）"
+      验证方法: "精度测试：≥50张标注图像，人工标注值 vs 识别值，误差<1%的比例≥95%"
+
+    - id: "C12"
+      item: "指针表读数准确率 ≥ 90%（标准光照条件下）"
+      验证方法: "精度测试：≥50张标注图像，人工标注值 vs 识别值，误差<2%的比例≥90%"
+
+  # ── 安全性 ──
+  safety:
+    - id: "C13"
+      item: "Skill执行期间不修改机器人运动状态（纯感知Skill，不控制执行器）"
+      验证方法: "代码审查：确认无运动指令调用；集成测试：执行期间监控关节状态不变"
+
+    - id: "C14"
+      item: "拍摄图像仅写入本地指定目录，不外传（离线模式合规）"
+      验证方法: "代码审查+网络监控测试"
+
+  # ── 可观测性 ──
+  observability:
+    - id: "C15"
+      item: "每步执行有结构化日志（含耗时、判断结果、中间数据摘要）"
+      验证方法: "执行1次完整流程，审查日志覆盖step_1到step_7"
+
+    - id: "C16"
+      item: "失败时诊断上下文包含：原始图像、裁剪图像、模型输出、WorldState快照"
+      验证方法: "触发失败场景，验证诊断上下文完整性"
+
+    - id: "C17"
+      item: "输出的MeterReading可被generate_report Skill直接消费（字段兼容）"
+      验证方法: "集成测试：read_meter输出 → generate_report输入，无字段缺失"
+```
+
+##### 七、Skill详细定义模板
+
+以上 read_meter 的结构作为所有Skill的详细定义标准模板。其他Skill编写时应包含以下完整章节：
+
+```
+Skill详细定义结构（标准模板）：
+
+  一、Skill接口定义 ────── YAML格式，包含：
+      │  name / version / category / description
+      │  capabilities（SOP Compiler匹配标签）
+      │  required_capabilities（硬件能力需求）
+      │  inference_requirements（推理模型需求，含降级策略）
+      │  inputs（类型、required、default、description）
+      │  outputs（类型、schema）
+      │  preconditions / postconditions（DSL表达式）
+      │  failure_modes（code、severity、possible_causes、recovery、max_attempts）
+      │  timeout_s / retry_policy
+      │
+  二、具体操作步骤 ────── 每步包含：
+      │  action（做什么）
+      │  detail（怎么做）
+      │  success_criteria（怎样算成功）
+      │  failure_branch（失败走哪里）
+      │  judgment_rules（判断阈值和分支逻辑）
+      │
+  三、判断标准与规则 ──── 汇总表：判断项 / 通过标准 / 不通过处理
+      │
+  四、场景案例 ────────── 至少4个：
+      │  正常路径 / 恢复成功 / 不可恢复 / 边界判断
+      │  每个案例含：输入 → 执行过程 → 输出
+      │
+  五、边界情况处理 ────── 枚举物理环境和系统层面的边界case
+      │
+  六、执行标准与检查清单 ─ 分类：
+         接口合规 / 条件校验 / 失败覆盖 / 性能指标 / 安全性 / 可观测性
+         每项含：编号、检查项、验证方法
+```
+
+### 4.3b MVP场景二：电力变电站巡检流程
+
+以下以电力变电站巡检场景为MVP第二验证目标，展示SOP从输入到DAG执行的全链路分解。该场景使用四足机器人（宇树Go2），覆盖导航、热成像、表计读数、异常检测、报告生成等核心能力。
+
+#### 4.3b.1 原始SOP输入
+
+```
+变电站日常巡检标准操作规程（SOP）v2.3
+
+1. 从基站出发，导航到1号变压器
+2. 拍摄1号变压器红外热成像
+3. 如果温度超过80度，立即发送高温告警
+4. 识别1号变压器关联表计，读取并记录读数
+5. 如果读数超出正常范围，发送异常告警
+6. 导航到2号变压器
+7. 拍摄2号变压器红外热成像
+8. 如果温度超过80度，立即发送高温告警
+9. 识别2号变压器关联表计，读取并记录读数
+10. 如果读数超出正常范围，发送异常告警
+11. 完成所有点位后导航返回基站
+12. 汇总本次巡检数据，生成巡检报告
+```
+
+#### 4.3b.2 SOP编译 — 步骤提取与意图映射
+
+| 步骤 | 原文摘要 | 映射Skill | 置信度 |
+|------|---------|----------|--------|
+| 1 | 从基站导航到1号变压器 | navigate_to_waypoint | 0.97 |
+| 2 | 拍摄红外热成像 | capture_thermal_image | 0.95 |
+| 3 | 温度>80°C则告警 | alert_operator (条件触发) | 0.92 |
+| 4 | 识别表计并读取读数 | read_meter | 0.94 |
+| 5 | 读数超范围则告警 | alert_operator (条件触发) | 0.91 |
+| 6-10 | 重复步骤1-5（2号变压器） | 同上Skill循环 | — |
+| 11 | 返回基站 | return_to_base | 0.98 |
+| 12 | 生成巡检报告 | generate_report | 0.93 |
+
+#### 4.3b.3 DAG构建
+
+```yaml
+dag:
+  id: "inspection-substation-full-001"
+  version: "1.0"
+  compiled_from: "变电站日常巡检SOP v2.3"
+  compile_hash: "sha256:def456..."
+
+  metadata:
+    scene_template: "电力巡检"
+    robot_type: "unitree-go2"
+    estimated_duration_s: 1800
+    waypoint_count: 2
+
+  nodes:
+    # === 1号变压器巡检 ===
+    - id: "n1_nav_t1"
+      skill: "navigate_to_waypoint"
+      params:
+        target: {waypoint_id: "transformer_1"}
+        speed: 0.8
+      depends_on: []
+      timeout_s: 120
+      retry_policy: {max: 3, backoff: "exponential"}
+
+    - id: "n2_thermal_t1"
+      skill: "capture_thermal_image"
+      params:
+        target_location: {ref: "n1_nav_t1.output.final_position"}
+        capture_params: {resolution: "640x480", mode: "snapshot"}
+      depends_on: ["n1_nav_t1"]
+      timeout_s: 30
+
+    - id: "n3_temp_check_t1"
+      type: "conditional"
+      condition: "n2_thermal_t1.output.temperature_map.max_temp > 80"
+      branches:
+        true:
+          - id: "n3a_alert_t1"
+            skill: "alert_operator"
+            params:
+              level: "warning"
+              message: "1号变压器高温异常: {n2_thermal_t1.output.temperature_map.max_temp}°C"
+              evidence: {ref: "n2_thermal_t1.output.thermal_image"}
+        false:
+          - id: "n3b_log_t1"
+            skill: "log_result"
+            params:
+              status: "normal"
+              category: "thermal"
+              data: {ref: "n2_thermal_t1.output.temperature_map"}
+      depends_on: ["n2_thermal_t1"]
+
+    - id: "n4_meter_t1"
+      skill: "read_meter"
+      params:
+        meter_id: "transformer_1_meter"
+        meter_type: "analog_gauge"
+        expected_range: {min: 220, max: 240, unit: "V"}
+      depends_on: ["n3_temp_check_t1"]
+      timeout_s: 45
+      retry_policy: {max: 2, backoff: "fixed", delay_s: 3}
+
+    - id: "n5_meter_check_t1"
+      type: "conditional"
+      condition: "n4_meter_t1.output.reading.value < 220 || n4_meter_t1.output.reading.value > 240"
+      branches:
+        true:
+          - id: "n5a_alert_t1"
+            skill: "alert_operator"
+            params:
+              level: "warning"
+              message: "1号变压器表计读数异常: {n4_meter_t1.output.reading.value}{n4_meter_t1.output.reading.unit}"
+              evidence: {ref: "n4_meter_t1.output.annotated_image"}
+        false:
+          - id: "n5b_log_t1"
+            skill: "log_result"
+            params:
+              status: "normal"
+              category: "meter_reading"
+              data: {ref: "n4_meter_t1.output.reading"}
+      depends_on: ["n4_meter_t1"]
+
+    # === 2号变压器巡检（结构同上） ===
+    - id: "n6_nav_t2"
+      skill: "navigate_to_waypoint"
+      params:
+        target: {waypoint_id: "transformer_2"}
+        speed: 0.8
+      depends_on: ["n5_meter_check_t1"]
+      timeout_s: 120
+      retry_policy: {max: 3, backoff: "exponential"}
+
+    - id: "n7_thermal_t2"
+      skill: "capture_thermal_image"
+      params:
+        target_location: {ref: "n6_nav_t2.output.final_position"}
+        capture_params: {resolution: "640x480", mode: "snapshot"}
+      depends_on: ["n6_nav_t2"]
+      timeout_s: 30
+
+    - id: "n8_temp_check_t2"
+      type: "conditional"
+      condition: "n7_thermal_t2.output.temperature_map.max_temp > 80"
+      branches:
+        true:
+          - id: "n8a_alert_t2"
+            skill: "alert_operator"
+            params:
+              level: "warning"
+              message: "2号变压器高温异常: {n7_thermal_t2.output.temperature_map.max_temp}°C"
+              evidence: {ref: "n7_thermal_t2.output.thermal_image"}
+        false:
+          - id: "n8b_log_t2"
+            skill: "log_result"
+            params:
+              status: "normal"
+              category: "thermal"
+              data: {ref: "n7_thermal_t2.output.temperature_map"}
+      depends_on: ["n7_thermal_t2"]
+
+    - id: "n9_meter_t2"
+      skill: "read_meter"
+      params:
+        meter_id: "transformer_2_meter"
+        meter_type: "analog_gauge"
+        expected_range: {min: 220, max: 240, unit: "V"}
+      depends_on: ["n8_temp_check_t2"]
+      timeout_s: 45
+      retry_policy: {max: 2, backoff: "fixed", delay_s: 3}
+
+    - id: "n10_meter_check_t2"
+      type: "conditional"
+      condition: "n9_meter_t2.output.reading.value < 220 || n9_meter_t2.output.reading.value > 240"
+      branches:
+        true:
+          - id: "n10a_alert_t2"
+            skill: "alert_operator"
+            params:
+              level: "warning"
+              message: "2号变压器表计读数异常: {n9_meter_t2.output.reading.value}{n9_meter_t2.output.reading.unit}"
+              evidence: {ref: "n9_meter_t2.output.annotated_image"}
+        false:
+          - id: "n10b_log_t2"
+            skill: "log_result"
+            params:
+              status: "normal"
+              category: "meter_reading"
+              data: {ref: "n9_meter_t2.output.reading"}
+      depends_on: ["n9_meter_t2"]
+
+    # === 收尾 ===
+    - id: "n11_return"
+      skill: "return_to_base"
+      params:
+        base_location: {waypoint_id: "charging_station"}
+        speed: 1.0
+      depends_on: ["n10_meter_check_t2"]
+      timeout_s: 180
+
+    - id: "n12_report"
+      skill: "generate_report"
+      params:
+        report_type: "daily_inspection"
+        data_sources:
+          - {ref: "n2_thermal_t1.output"}
+          - {ref: "n4_meter_t1.output"}
+          - {ref: "n7_thermal_t2.output"}
+          - {ref: "n9_meter_t2.output"}
+        include_alerts: true
+        template: "substation_daily"
+      depends_on: ["n11_return"]
+      timeout_s: 30
+```
+
+#### 4.3b.4 DAG可视化
+
+```
+  [n1 导航1号变压器] → [n2 热成像拍摄]
+                            │
+                            ▼
+                     [n3 温度检查]
+                      ╱         ╲
+                 >80°C           ≤80°C
+                  │                │
+           [n3a 高温告警]    [n3b 正常日志]
+                  ╲              ╱
+                    ▼          ▼
+                  [n4 表计读数]
+                       │
+                       ▼
+                 [n5 读数检查]
+                  ╱         ╲
+              超范围        正常
+                │             │
+         [n5a 读数告警] [n5b 正常日志]
+                ╲            ╱
+                  ▼        ▼
+           [n6 导航2号变压器] → [n7 热成像拍摄]
+                                     │
+                                     ▼
+                              [n8 温度检查]
+                               ╱         ╲
+                          >80°C           ≤80°C
+                           │                │
+                    [n8a 告警]        [n8b 日志]
+                           ╲              ╱
+                             ▼          ▼
+                           [n9 表计读数]
+                                │
+                                ▼
+                          [n10 读数检查]
+                           ╱         ╲
+                       超范围        正常
+                         │             │
+                  [n10a 告警]    [n10b 日志]
+                         ╲            ╱
+                           ▼        ▼
+                        [n11 返回基站]
+                              │
+                              ▼
+                       [n12 生成报告]
+```
+
+#### 4.3b.5 能力需求分析
+
+| 原子能力 | 使用节点 | 必需/可选 | 降级方案 |
+|---------|---------|----------|---------|
+| locomotion.walking | n1,n6,n11 | 必需 | 无（核心功能） |
+| perception.localization | n1,n6,n11 | 必需 | 无 |
+| perception.vision(thermal) | n2,n7 | 必需 | 降级为RGB+温度传感器（精度下降） |
+| perception.vision(rgb) | n4,n9 | 必需 | 无（表计读数核心能力） |
+| communication.network | n3a,n5a,n8a,n10a,n12 | 必需 | 离线缓存，回基站后上传 |
+
+#### 4.3b.6 记忆系统对巡检流程的优化
+
+| 记忆类型 | 作用 | 示例 |
+|---------|------|------|
+| Task Memory | 相同SOP+Skill版本+机器人能力 → 编译缓存命中（0ms） | 每日巡检SOP不变时跳过LLM编译 |
+| Execution Memory | 累积每个点位的最佳拍摄角度、表计识别参数 | 1号变压器表计在左偏15°拍摄识别率最高 |
+| Spatial Memory | 持久化变电站布局、设备精确位置、最优巡检路径 | 绕过积水区域的替代路径 |
+
+#### 4.3b.7 巡检报告生成Skill设计（generate_report）
+
+```yaml
+skill:
+  name: "generate_report"
+  version: "1.0.0"
+  category: "reporting"
+  description: "汇总巡检过程中采集的热成像、表计读数、异常告警等数据，生成结构化巡检报告"
+
+  capabilities:
+    - "data_aggregation"
+    - "report_generation"
+    - "template_rendering"
+
+  required_capabilities: []
+
+  inference_requirements:
+    - type: "none"
+      note: "Phase 1使用模板引擎生成报告，不依赖推理模型"
+
+  inputs:
+    - name: "report_type"
+      type: "string"
+      required: true
+      enum: ["daily_inspection", "fault_investigation", "periodic_summary"]
+      description: "报告类型"
+    - name: "data_sources"
+      type: "list[DataRef]"
+      required: true
+      description: "数据来源引用列表（热成像输出、表计读数输出等）"
+    - name: "include_alerts"
+      type: "bool"
+      required: false
+      default: true
+      description: "是否包含告警汇总"
+    - name: "template"
+      type: "string"
+      required: false
+      default: "default"
+      description: "报告模板名称"
+
+  outputs:
+    - name: "report"
+      type: "InspectionReport"
+      schema:
+        report_id: "string"
+        generated_at: "timestamp"
+        summary:
+          total_waypoints: "int"
+          inspected_waypoints: "int"
+          alerts_count: "int"
+          anomalies: "list[AnomalySummary]"
+        thermal_results: "list[ThermalResult]"
+        meter_readings: "list[MeterReading]"
+        alerts: "list[AlertRecord]"
+        conclusion: "string"
+        file_path: "string"
+
+  preconditions:
+    - "len(data_sources) > 0"
+
+  postconditions:
+    - "output.report.report_id != ''"
+    - "output.report.file_path != ''"
+
+  failure_modes:
+    - code: "DATA_SOURCE_EMPTY"
+      severity: "error"
+      possible_causes: ["所有巡检节点均失败，无有效数据"]
+      recovery:
+        strategy: "escalate_to_human"
+        params: {context: "巡检数据为空，无法生成报告"}
+      max_attempts: 1
+
+    - code: "TEMPLATE_NOT_FOUND"
+      severity: "warning"
+      possible_causes: ["指定模板不存在"]
+      recovery:
+        strategy: "retry_after"
+        params: {delay_s: 0, max: 1, fallback_template: "default"}
+      max_attempts: 1
+
+    - code: "REPORT_WRITE_FAILED"
+      severity: "error"
+      possible_causes: ["磁盘空间不足", "文件系统权限错误"]
+      recovery:
+        strategy: "invoke_skill"
+        params: {skill_name: "alert_operator", level: "error", message: "报告写入失败，原始数据已缓存"}
+      max_attempts: 2
+
+  timeout_s: 30
+  retry_policy: {max: 1, backoff: "fixed", delay_s: 1}
+```
+
 ### 4.4 执行引擎设计
 
 #### 4.4.1 核心状态机
@@ -2059,12 +3011,32 @@ skill:
            条件不满足                                 条件满足
            (等待/超时)                                    │
                 │                                         ▼
-                │                                    RUNNING
-                │                                   (执行中)
-                │                                    │    │
-                │                              成功 ─┘    └─ 失败
-                │                               │              │
-                ▼                               ▼              ▼
+                │                                    RUNNING ◄─────────────┐
+                │                                   (执行中)                │
+                │                                    │    │                │
+                │                              成功 ─┘    └─ 失败         │
+                │                               │              │          │
+                │                               │         ┌────┘          │
+                │                               │         │               │
+                │                               │    人工接管请求?          │
+                │                               │    │         │          │
+                │                               │   是         否         │
+                │                               │    │         │          │
+                │                               │    ▼         │          │
+                │                               │ PAUSED_      │          │
+                │                               │ FOR_HUMAN    │          │
+                │                               │ (等待人工     │          │
+                │                               │  操作完成)    │          │
+                │                               │    │         │          │
+                │                               │ 归还控制权    │          │
+                │                               │ skill_outcome│          │
+                │                               │    │         │          │
+                │                               │  ┌─┴──┐      │          │
+                │                               │  │    │      │          │
+                │                               │ 完成 部分完成─┼──────────┘
+                │                               │  │   /跳过    │ (从断点恢复)
+                │                               │  │           │
+                ▼                               ▼  ▼           ▼
             BLOCKED                         SUCCESS        FAILED
           (阻塞/超时)                       (完成)        (执行失败)
                 │                               │              │
@@ -2195,6 +3167,202 @@ recovery_actions:
 - 导航时发现障碍物 → 调用避障子策略，动态调整路径
 - 拍照时光线不足 → 调整曝光参数或更换拍照位置
 - 温度读数异常 → 多次测量取均值，排除传感器噪声
+
+#### 4.4.5 人工接管控制权切换协议
+
+需求 E2.2 要求"操作员接管机器人控制，手动完成当前Skill后归还控制权"。本节定义控制权在执行引擎与人类操作员之间切换的完整语义。
+
+**控制权状态模型：**
+
+```
+                    ┌─────────────────────────────────────────────────┐
+                    │            控制权归属（ControlAuthority）          │
+                    │                                                  │
+                    │   AUTONOMOUS ◄──────────► HUMAN_CONTROLLED      │
+                    │  (执行引擎控制)    切换协议   (人工控制)            │
+                    │       │                         │                 │
+                    │       │                    EMERGENCY_STOPPED     │
+                    │       │                    (紧急停止,全部冻结)     │
+                    └───────┴─────────────────────────┴────────────────┘
+
+状态定义:
+  AUTONOMOUS:         执行引擎正常调度Skill，人工指令被拒绝（紧急停止除外）
+  HUMAN_CONTROLLED:   执行引擎暂停调度，人工指令直通机器人底层控制
+  EMERGENCY_STOPPED:  机器人全部关节/执行器锁定，任何新运动指令被拒绝，仅接受解锁或断电
+```
+
+**接管流程（AUTONOMOUS → HUMAN_CONTROLLED）：**
+
+```
+操作员                    Dashboard后端              机器人端执行引擎
+  │                          │                          │
+  │─── 点击"一键接管" ──────→│                          │
+  │                          │─── TakeoverRequest ─────→│
+  │                          │    {operator_id,          │
+  │                          │     reason,               │
+  │                          │     scope: CURRENT_SKILL} │
+  │                          │                          │
+  │                          │     ┌────────────────────┤
+  │                          │     │ 1. 当前Skill收到    │
+  │                          │     │    PAUSE信号        │
+  │                          │     │ 2. Skill Runner进入 │
+  │                          │     │    PAUSED_FOR_HUMAN │
+  │                          │     │    (安全停止点)      │
+  │                          │     │ 3. DAG遍历器暂停    │
+  │                          │     │    后续节点调度      │
+  │                          │     │ 4. 保存断点快照:     │
+  │                          │     │    - 当前Skill进度   │
+  │                          │     │    - WorldState      │
+  │                          │     │    - DAG执行位置     │
+  │                          │     └────────────────────┤
+  │                          │                          │
+  │                          │◄── TakeoverAck ──────────│
+  │                          │    {status: READY,        │
+  │                          │     checkpoint_id,        │
+  │                          │     current_skill_state,  │
+  │                          │     world_state_snapshot}  │
+  │                          │                          │
+  │◄── 控制面板激活 ─────────│                          │
+  │    (方向/速度/动作可操作)  │                          │
+  │                          │                          │
+  │═══ 双向Streaming ════════╪══════════════════════════│
+  │    ControlCommand ──────→│──────────────────────────→│ 直通底层控制
+  │    ◄── RobotFeedback ───│◄──────────────────────────│ 实时反馈
+```
+
+**Skill Runner 可接管态（PAUSED_FOR_HUMAN）：**
+
+```cpp
+// Skill Runner状态扩展
+enum class SkillRunState {
+    IDLE,
+    RUNNING,
+    PAUSED_FOR_HUMAN,  // 新增：已安全暂停，等待人工操作
+    COMPLETED,
+    FAILED
+};
+
+// 接管时Skill Runner的行为
+class SkillRunner {
+    void on_takeover_request(const TakeoverRequest& req) {
+        // 1. 向当前Skill发送暂停信号
+        current_skill_->request_pause();
+
+        // 2. 等待Skill到达安全停止点（最长5秒）
+        //    安全停止点由Skill自行定义：
+        //    - navigate: 停止运动,保持当前位姿
+        //    - capture_thermal_image: 完成当前帧采集后停止
+        //    - manipulation: 完成当前原子动作后停止（不在力施加中途停）
+        if (!current_skill_->wait_for_safe_pause(PAUSE_TIMEOUT_S)) {
+            // 超时：强制暂停，记录警告
+            current_skill_->force_pause();
+            audit_.log("force_pause_on_takeover", ...);
+        }
+
+        // 3. 切换控制权
+        state_ = SkillRunState::PAUSED_FOR_HUMAN;
+        control_authority_ = ControlAuthority::HUMAN_CONTROLLED;
+
+        // 4. 禁止调度器发送新的Skill执行指令
+        dag_executor_->suspend_scheduling();
+
+        // 5. 保存断点
+        checkpoint_ = save_checkpoint(current_skill_, world_state_);
+    }
+};
+```
+
+**指令仲裁规则（人工指令 vs 调度器指令）：**
+
+```
+┌─────────────────┬──────────────────┬──────────────────┬──────────────────┐
+│ 控制权状态       │ 调度器指令        │ 人工控制指令      │ 紧急停止          │
+├─────────────────┼──────────────────┼──────────────────┼──────────────────┤
+│ AUTONOMOUS      │ ✅ 执行           │ ❌ 拒绝+提示     │ ✅ 立即执行       │
+│ HUMAN_CONTROLLED│ ❌ 排队等待       │ ✅ 直通执行       │ ✅ 立即执行       │
+│ EMERGENCY_STOPPED│ ❌ 拒绝          │ ❌ 拒绝          │ ✅ 仅接受解锁     │
+└─────────────────┴──────────────────┴──────────────────┴──────────────────┘
+
+仲裁器位于Skill Runner内部，硬编码优先级:
+  紧急停止 > 人工控制指令 > 调度器指令
+  不可通过配置或远端指令更改此优先级顺序
+```
+
+**归还控制权（HUMAN_CONTROLLED → AUTONOMOUS）：**
+
+操作员完成手动操作后，通过Dashboard点击"归还控制权"。归还前必须满足以下条件：
+
+```yaml
+handback_preconditions:
+  # 全部满足才允许归还
+  safety_check:
+    - robot_in_safe_pose: true        # 机器人处于安全位姿（非悬空/非碰撞姿态）
+    - no_active_motion: true          # 无正在执行的运动指令
+    - all_actuators_idle: true        # 所有执行器空闲
+
+  operator_confirmation:
+    - operator_declares_complete: true # 操作员明确确认"手动操作完成"
+    - handback_reason: "string"        # 操作员填写归还说明（供审计）
+
+  # 可选：操作员标记当前Skill的完成状态
+  skill_outcome:
+    type: "enum"
+    options:
+      - COMPLETED_BY_HUMAN   # 人工已完成该Skill目标，DAG跳到下一节点
+      - PARTIALLY_DONE       # 部分完成，从断点恢复继续执行当前Skill
+      - SKIP_THIS_SKILL      # 跳过该Skill，继续DAG后续节点
+      - ABORT_DAG            # 终止整个DAG
+```
+
+**归还后恢复执行：**
+
+```
+操作员                    Dashboard后端              机器人端执行引擎
+  │                          │                          │
+  │─── 点击"归还控制权" ────→│                          │
+  │    {skill_outcome:       │                          │
+  │     COMPLETED_BY_HUMAN,  │                          │
+  │     handback_reason:     │                          │
+  │     "已手动对准表计"}     │                          │
+  │                          │─── HandbackRequest ─────→│
+  │                          │                          │
+  │                          │     ┌────────────────────┤
+  │                          │     │ 1. 校验归还前置条件 │
+  │                          │     │ 2. 切换控制权回     │
+  │                          │     │    AUTONOMOUS       │
+  │                          │     │ 3. 根据skill_outcome│
+  │                          │     │    决定DAG恢复策略:  │
+  │                          │     │    - COMPLETED →     │
+  │                          │     │      标记当前节点    │
+  │                          │     │      SUCCESS,       │
+  │                          │     │      调度下一节点    │
+  │                          │     │    - PARTIALLY →     │
+  │                          │     │      从断点恢复      │
+  │                          │     │      当前Skill       │
+  │                          │     │    - SKIP → 跳过,   │
+  │                          │     │      继续DAG        │
+  │                          │     │    - ABORT → 终止   │
+  │                          │     │ 4. 恢复调度器       │
+  │                          │     └────────────────────┤
+  │                          │                          │
+  │                          │◄── HandbackAck ─────────│
+  │◄── 控制面板禁用 ─────────│                          │
+```
+
+**超时与异常保护：**
+
+```yaml
+takeover_safeguards:
+  # 接管超时：操作员长时间不操作也不归还
+  idle_timeout_minutes: 30
+  idle_action: "Dashboard弹窗提醒操作员；超时后自动尝试恢复AUTONOMOUS（仅当机器人处于安全位姿）"
+
+  # 网络断连：接管期间Dashboard与机器人端连接丢失
+  disconnect_action: "机器人端保持HUMAN_CONTROLLED状态不变（不自动恢复），原地静止等待重连；超过5分钟未重连触发本地安全策略（返回基站或原地停机）"
+
+  # 并发接管：多个操作员同时尝试接管
+  concurrency: "单机器人同一时刻仅允许一个操作员持有控制权，后续接管请求排队或拒绝"
+```
 
 ### 4.5 WorldState模型
 
@@ -2450,10 +3618,12 @@ Dashboard（Web UI）
 │   ├── 空间记忆查看/编辑
 │   └── 记忆命中统计
 │
-├── Practice回放（Phase 2+）
-│   ├── 历史任务列表
-│   ├── 逐帧回放（传感器数据流+决策过程+Skill调用链）
-│   └── 执行对比分析
+├── Practice查询与回放
+│   ├── 历史任务列表（按时间/状态/机器人筛选）（Phase 1）
+│   ├── Practice详情查看（DAG执行记录、决策记录、记忆命中、环境变化）（Phase 1）
+│   ├── 基础回放（按Skill节点粒度回放执行过程：节点状态变迁+参数+结果）（Phase 1）
+│   ├── 逐帧回放（传感器数据流+决策过程+Skill调用链，按时间线逐帧）（Phase 2+）
+│   └── 执行对比分析（同一SOP不同次执行的差异对比）（Phase 2+）
 │
 └── 审计日志
     ├── 操作日志查询
@@ -2491,7 +3661,7 @@ Browser ──WebSocket──→ Dashboard Backend ──→ 数据服务层
 - dag_progress_updated: DAG整体进度更新
 - robot_state_updated:  机器人位姿/电量/传感器更新（1Hz）
 - alert_triggered:      告警触发
-- human_takeover:       人工接管事件
+- human_takeover:       人工接管事件（含子类型: takeover_requested / takeover_ready / handback_requested / handback_completed / takeover_idle_warning）
 - memory_hit:           记忆命中事件（展示哪条记忆影响了决策）
 ```
 
@@ -2888,11 +4058,60 @@ practice:
     autonomy_rate: 1.0               # 本次执行的自主率
 ```
 
-### 9.2 Practice存储
+### 9.2 Practice存储与查询
 
+**存储：**
 - **Phase 1：** SQLite，按task_run_id索引
 - **Phase 3+：** TimescaleDB，支持时序查询和聚合分析
 - **存储策略：** 完整Practice保留90天，之后压缩为摘要（保留统计数据，丢弃传感器原始数据）
+
+**查询API（Phase 1，对齐需求V1.2 P0）：**
+
+```python
+# Practice查询接口（远端Python服务，Dashboard调用）
+class PracticeQuery:
+    def list(self, filters: dict) -> list[PracticeSummary]:
+        """按条件筛选Practice列表
+        filters: {robot_model, environment, status, time_range, dag_id}
+        返回: 摘要列表（id, 时间, 状态, 节点统计, 自主率）"""
+
+    def get(self, practice_id: str) -> Practice:
+        """获取完整Practice记录（含execution_records, decisions, memory_hits等）"""
+
+    def get_node_detail(self, practice_id: str, node_id: str) -> NodeRecord:
+        """获取单个Skill节点的执行详情（输入参数、输出结果、耗时、重试记录）"""
+```
+
+**基础回放（Phase 1，对齐需求V1.2 P0）：**
+
+```
+基础回放 ≠ 逐帧回放。
+
+Phase 1 基础回放：按Skill节点粒度回放
+  ┌──────────────────────────────────────────────────┐
+  │  DAG可视化 + 时间轴                                │
+  │                                                    │
+  │  [n1:navigate ✓] → [n2:capture ✓] → [n3:detect ✓]│
+  │   75s              12s              8s             │
+  │                                                    │
+  │  点击节点展开：                                     │
+  │    输入参数、输出结果、状态变迁时间线、              │
+  │    恢复策略执行记录、记忆命中情况                    │
+  │                                                    │
+  │  数据来源: Practice.execution_records（结构化数据）  │
+  └──────────────────────────────────────────────────┘
+
+Phase 2 逐帧回放（需求V1.4 P2）：按时间线逐帧回放
+  ┌──────────────────────────────────────────────────┐
+  │  统一时间轴 + 多通道同步                            │
+  │                                                    │
+  │  传感器数据流（相机画面、力传感器波形、位姿轨迹）   │
+  │  + 决策过程（条件判断、参数调整、分支选择）         │
+  │  + Skill调用链（状态机变迁的逐帧动画）              │
+  │                                                    │
+  │  数据来源: 传感器原始数据流（需额外采集和存储）     │
+  └──────────────────────────────────────────────────┘
+```
 
 ---
 
@@ -3164,6 +4383,8 @@ skill:
       fallback_deployment: "remote"          # 边缘不可用时回退远端
       input: "cropped_image"
       output: "anomaly_label + confidence"
+      optional: true                         # Phase 1可选：无分类模型时回退阈值模式
+      phase: "P1"                            # P1交付，与U4.4优先级对齐
 
     - name: "deep_analysis"
       type: "vlm"
@@ -3172,6 +4393,14 @@ skill:
       input: "image + context_text"
       output: "analysis_report"
       optional: true                         # 可选：没有也能完成基础检测
+      phase: "P1"                            # P1交付，与U4.4优先级对齐
+
+  # Phase 1降级策略：
+  # 当anomaly_classification模型不可用时，detect_anomaly回退为"阈值模式"：
+  #   1. 使用P0目标检测模型定位设备区域（bounding boxes）
+  #   2. 结合热成像数据，按模板配置的temperature_threshold做阈值判断
+  #   3. 超阈值 → 标记异常并触发alert_operator
+  # Phase 2升级为"分类模式"：阈值初筛 + 分类模型精细判断 + 可选VLM深度分析
 ```
 
 ### 10.8 模型输出审计
@@ -3270,17 +4499,21 @@ scene_template:
     1. 从基站出发，导航到1号变压器
     2. 拍摄1号变压器红外热成像
     3. 如果温度超过80度，发送高温告警
-    4. 导航到2号变压器...
-    5. 完成所有点位后返回基站
+    4. 识别1号变压器关联表计，读取并记录读数
+    5. 导航到2号变压器...（重复步骤2-4）
+    6. 完成所有点位后返回基站
+    7. 汇总本次巡检数据，生成巡检报告
 
   # 已验证的Skill组合
   required_skills:
     - navigate_to_waypoint
     - capture_thermal_image
     - detect_anomaly
+    - read_meter           # 表计读数识别（对准表计拍照 → 数字/指针识别 → 输出结构化读数）
     - alert_operator
     - return_to_base
     - log_result
+    - generate_report      # 巡检报告生成（汇总热成像、表计读数、异常告警 → 结构化报告）
 
   # 可配置参数
   configurable_params:
@@ -3304,6 +4537,9 @@ scene_template:
   failure_handling:
     navigation_blocked: "尝试绕行，3次失败后跳过并告警"
     camera_error: "重试3次，失败后继续下一点位"
+    anomaly_model_unavailable: "Phase 1常态：回退阈值模式（目标检测+热成像阈值），不阻塞巡检流程"
+    meter_read_failed: "重试2次（调整角度/光照），失败后记录原始图像供人工复核"
+    report_generation_failed: "重试1次，失败后上传原始数据至远端由远端生成"
     low_battery: "电量<20%时返回基站充电"
 
   # 适用机器人
@@ -3556,7 +4792,7 @@ scene_template:
 
 | 指标 | 首次执行 | 第10次 | 第100次 |
 |------|---------|--------|---------|
-| SOP编译耗时 | 3-5秒 | 0秒（缓存命中） | 0秒 |
+| SOP编译耗时 | 3-5秒 | 0秒（相同SOP缓存命中） | 0秒 |
 | 导航路径效率 | 盲目规划 | 已知路径复用 | 最优路径 |
 | 异常检测精度 | 固定阈值 | 设备基线对比 | 趋势预测 |
 | 执行正确率 | 基线 | +15% | +30% |
@@ -3872,6 +5108,8 @@ Docker Compose部署:
 
 ## 十八、里程碑与验证标准
 
+> **优先级与阶段映射**（与需求列表一致）：P0=Phase 1 (Month 1-2) / P1=Phase 2 (Month 3-4) / P2=Phase 3 (Month 5-6) / P3=Phase 4 (Month 7-9)
+
 ### Phase 1 (Month 1-2): MVP验证
 
 **运行平台：** NVIDIA Jetson AGX Orin 64GB
@@ -3879,18 +5117,21 @@ Docker Compose部署:
 **交付物：**
 1. SOP Compiler五步编译流水线
 2. e-URDF标准定义和解析器（含送药机器人和巡检机器人示例）
-3. Skill接口标准 + 11个核心Skill桩（送药：导航、语音、力感知等待、重量检查、目标检测、开门、条件等待、告警、日志；巡检：热成像、异常检测、回基站。共享：导航、告警、日志）
+3. Skill接口标准 + 13个核心Skill桩（送药：导航、语音、力感知等待、重量检查、目标检测、开门、条件等待、告警、日志；巡检：热成像、异常检测、表计读数、报告生成、回基站。共享：导航、告警、日志）
 4. DAG Schema（顺序+条件分支）
 5. 执行引擎骨架（C++ + TensorRT，状态机+基础顺序执行+异常恢复）
-6. 边缘推理运行时（TensorRT后端 + 首批边缘模型，含门/床位/设备检测 + ASR + TTS）
-7. Practice记录基础（数据采集+存储）
-8. Task Memory（编译缓存）
+6. 边缘推理运行时（TensorRT后端 + 首批边缘模型，含门/床位/设备检测 + 表计读数识别 + ASR + TTS）
+7. Practice记录基础（数据采集+存储+查询+基础回放）
+8. Task Memory（编译缓存）+ Execution Memory基础记录（Skill执行参数/耗时/成功率的结构化记录，Phase 2参数推导的数据基础）
 9. 医院送药场景模板（**首要**）+ 电力巡检场景模板
 10. Docker容器化部署（远端）+ C++原生部署（Jetson AGX Orin）
 
 **验证标准：**
 - **送药场景（首要）：** 可演示护士送药全链路 —— 输入送药SOP → 编译为Skill DAG → 机器人执行：药房取药 → 导航 → 开门 → 识别床位 → 语音交互 → 力感知交接 → 返回上报
-- **巡检场景：** 可演示"改SOP不改代码"完整流程：输入自然语言SOP → 编译为Skill DAG → 修改SOP → 自动更新执行计划 → 第二次编译缓存命中(0ms)
+- **巡检场景：** 可演示"改SOP不改代码"完整流程，验证两项能力：
+  - **编译缓存：** 相同SOP第二次编译缓存命中（0ms），证明Task Memory缓存机制有效
+  - **灵活编排：** 修改SOP文本后自动触发重新编译，生成新的Skill DAG，无需修改任何代码。重新编译耗时3-5秒（LLM调用），新结果自动写入Task Memory供后续命中
+  - 端到端能力验证：热成像检测 + 阈值模式异常判断（P0，分类模型在Phase 2/P1到位后升级）+ 表计读数识别（准确率≥90%）+ 异常告警 + 巡检报告自动生成
 - 边缘模型在Jetson AGX Orin上推理延迟达标（检测<20ms, ASR<100ms, TTS<50ms）
 
 ### Phase 2 (Month 3-4): 引擎完善
@@ -3923,9 +5164,12 @@ Docker Compose部署:
 - 仿真环境集成（用于Skill验证、回归测试和Darwin评测，不替代真机验证）
 
 **验证标准：**
-- 送药场景真机端到端跑通（送药客户优先验证）
-- 巡检场景真机端到端跑通
-- 国产芯片端到端性能达到Jetson基线的90%+
+- 送药场景真机端到端跑通（送药客户优先验证），连续10+次任务成功率≥90%
+- 巡检场景真机端到端跑通，连续10+次任务成功率≥90%
+- 国产芯片端到端性能达到Jetson基线的90%+（推理延迟、吞吐量）
+- Skill跨本体迁移：同一Skill在2种以上机器人本体上通过验证
+- Spatial Memory真机验证：环境特征持久化后，重复导航任务路径效率提升≥10%
+- Know/How知识引擎：执行卡住时在线提示命中率≥70%（人工评估）
 
 ### Phase 4 (Month 7-9): 产品化
 
@@ -3936,6 +5180,14 @@ Docker Compose部署:
 - Darwin评测体系
 - Swarm多机协作
 - 场景模板库扩展
+
+**验证标准：**
+- 自主率≥95%（连续20+次任务运行，无需人工介入完成的Skill执行次数/总次数）
+- Darwin六道关卡评测体系上线，至少3个Skill通过全部评测并晋升Champion
+- ClawHub上架≥10个经验证Skill，支持上传/下载/版本管理
+- Swarm多机协作：2台机器人协同完成单个巡检任务，总耗时较单机减少≥30%
+- 场景模板库≥3个（送药+巡检+至少1个新场景），每个模板含完整SOP/Skill/参数/失败处理
+- 数据飞轮可衡量：SOP编译耗时、导航效率、异常检测精度中至少2项展现可量化改善趋势
 
 ---
 

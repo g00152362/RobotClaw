@@ -16,6 +16,15 @@
 
 优先级：P0=MVP必须 / P1=引擎完善阶段 / P2=真机验证阶段 / P3=产品化阶段
 
+**优先级与实施阶段映射：**
+
+| 优先级 | 实施阶段 | 时间线 | 运行平台 |
+|--------|---------|--------|---------|
+| **P0** | Phase 1 | Month 1-2 | NVIDIA Jetson AGX Orin 64GB |
+| **P1** | Phase 2 | Month 3-4 | Jetson + 国产芯片首批适配 |
+| **P2** | Phase 3 | Month 5-6 | 真机验证（送药真机优先） |
+| **P3** | Phase 4 | Month 7-9 | 产品化交付 |
+
 **场景优先级：** 第一阶段聚焦**医院护士送药**场景（有明确客户），第二阶段扩展至**电力巡检**场景。两个场景在P0阶段并行推进，资源冲突时送药优先。
 
 ---
@@ -46,7 +55,7 @@
 | U2.4 | 前置/后置条件 | 使用与语言无关的条件DSL：属性访问、比较运算、布尔运算、内建函数（distance_to, contains, len）。机器人端由C++求值引擎解析（Phase 1: JSON规则引擎, Phase 2+: 可选Lua嵌入） | P0 |
 | U2.5 | 恢复策略枚举 | 支持参数化恢复策略：retry_after(delay, max)、invoke_skill(skill_name, params)、escalate_to_human(context)、skip_and_log(reason)、abort_dag(reason) | P0 |
 | U2.6 | 送药核心Skill桩 | Phase 1实现送药场景核心Skill桩：导航(navigate_to_waypoint)、语音播报(speak_text)、重量变化等待(wait_for_weight_change)、目标检测(detect_target)、开门(open_door)、条件等待(wait_for_condition)、重量检查(check_weight)、告警(alert_operator)、日志记录(log_result) | P0 |
-| U2.6b | 巡检核心Skill桩 | Phase 1实现巡检场景核心Skill桩：导航(navigate_to_waypoint)、热成像(capture_thermal_image)、异常检测(detect_anomaly)、告警(alert_operator)、回基站(return_to_base)、日志记录(log_result)。与送药场景共享导航、告警、日志Skill | P0 |
+| U2.6b | 巡检核心Skill桩 | Phase 1实现巡检场景核心Skill桩：导航(navigate_to_waypoint)、热成像(capture_thermal_image)、异常检测(detect_anomaly)、表计读数(read_meter)、告警(alert_operator)、回基站(return_to_base)、日志记录(log_result)、报告生成(generate_report)。与送药场景共享导航、告警、日志Skill | P0 |
 | U2.7 | Skill跨本体迁移 | 同一Skill意图根据不同机器人本体的e-URDF描述，自动进行约束适配和验证（Teach Once, Embody Anywhere） | P2 |
 | U2.8 | Skill能力声明 | 每个Skill声明其能力标签、适用本体列表、所需传感器、环境要求，供SOP Compiler匹配和Skill Registry查询 | P0 |
 
@@ -128,7 +137,7 @@
 
 | 编号 | 需求 | 描述 | 优先级 |
 |------|------|------|--------|
-| V2.1 | 任务记忆 (Task Memory) | 缓存SOP到Skill DAG的编译结果，key=hash(SOP文本+Skill Registry版本)，命中时跳过LLM调用 | P0 |
+| V2.1 | 任务记忆 (Task Memory) | 缓存SOP到Skill DAG的编译结果，key=hash(SOP文本+Skill Registry版本+机器人能力画像)，命中时跳过LLM调用。同一SOP在不同能力的机器人上编译结果不同 | P0 |
 | V2.2 | 执行记忆 (Execution Memory) | 记录Skill在特定环境+机器人型号下的历史执行数据（参数、耗时、成功率），自动推导推荐参数 | P0(基础记录) / P1(参数推导) |
 | V2.3 | 空间记忆 (Spatial Memory) | 持久化机器人对环境的认知：设备位置、环境基线、最优路径、历史异常区域 | P1(仿真) / P2(真机) |
 | V2.4 | 视觉参考 (Visual Reference) | Spatial Memory中每个landmark可携带视觉参考图片（正常/异常状态），支持自动采集、人工上传、异常存档，用于图像对比式异常检测 | P1(数据结构) / P2(自动采集+对比检测) |
@@ -269,11 +278,11 @@
 
 1. **SOP Compiler** — 五步编译流水线，≥80%准确率，编译缓存
 2. **e-URDF标准** — 扩展机器人描述定义和解析器，含送药机器人和巡检机器人示例
-3. **Skill接口标准** — 含11个核心Skill桩，覆盖送药场景（导航、语音、力感知、开门、目标检测、条件等待、重量检查、告警、日志）和巡检场景（热成像、异常检测、回基站），共享导航/告警/日志Skill
+3. **Skill接口标准** — 含13个核心Skill桩，覆盖送药场景（导航、语音、力感知、开门、目标检测、条件等待、重量检查、告警、日志）和巡检场景（热成像、异常检测、表计读数、报告生成、回基站），共享导航/告警/日志Skill
 4. **DAG Schema** — 序列化格式 + 顺序/条件分支节点
 5. **执行引擎骨架** — C++实现，状态机框架 + 基础顺序执行 + 异常恢复
-6. **边缘推理运行时** — C++推理基础设施 + 首批边缘模型（目标检测含门/床位/设备 + 语音ASR + 语音TTS）
-7. **Practice记录基础** — 执行数据采集和存储
+6. **边缘推理运行时** — C++推理基础设施 + 首批边缘模型（目标检测含门/床位/设备 + 表计读数识别 + 语音ASR + 语音TTS）
+7. **Practice记录基础** — 执行数据采集、存储、查询和基础回放（按Skill节点粒度）
 8. **Task Memory** — SOP编译结果缓存
 9. **首批场景模板** — 医院送药模板（**首要**）+ 电力巡检模板
 10. **Docker容器化部署**（远端）+ C++原生部署（机器人端）
@@ -282,4 +291,7 @@
 
 > **里程碑验证标准：**
 > - **送药场景（首要）：** 可演示护士送药全链路 —— 输入送药SOP → 编译为Skill DAG → 机器人执行：药房取药 → 导航 → 开门 → 识别床位 → 语音交互 → 力感知交接 → 返回上报
-> - **巡检场景：** 可演示"改SOP不改代码"的完整流程 —— 输入自然语言SOP → 编译为Skill DAG → 修改SOP → 自动更新执行计划 → 第二次编译缓存命中(0ms)
+> - **巡检场景：** 可演示"改SOP不改代码"完整流程，验证两项能力：
+>   - **编译缓存：** 相同SOP第二次编译缓存命中（0ms），证明Task Memory有效
+>   - **灵活编排：** 修改SOP文本后自动触发重新编译，生成新的Skill DAG，无需修改任何代码（重新编译耗时3-5秒）
+>   - 端到端能力验证：热成像检测 + 表计读数识别（准确率≥90%）+ 异常告警 + 巡检报告自动生成
