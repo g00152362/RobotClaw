@@ -13,6 +13,11 @@
 
 RobotClaw是Physical AI Harness平台，核心使命：**理解人类标准操作（SOP），让机器人正确执行，并在执行中持续进化**。
 
+**MVP验证场景：**
+- **第一阶段（首要）：医院护士送药** — 定制送药机器人（轮式底盘+药箱+推杆），单楼层，涵盖导航、语音交互、力感知、物理开门、视觉识别
+- **第二阶段：电力巡检** — 四足/轮式巡检机器人，涵盖导航、热成像、异常检测、告警、报告生成
+- 两个场景在P0阶段并行推进，资源冲突时送药优先
+
 系统设计围绕三个核心能力展开：
 
 - **理解层（Understand）**：将自然语言SOP编译为结构化Skill DAG，匹配机器人能力
@@ -44,6 +49,174 @@ RobotClaw是Physical AI Harness平台，核心使命：**理解人类标准操�
 - 底层运动控制（由机器人SDK负责，通过RML接入）
 - 视觉/感知算法实现（由Provider模型负责）
 - 硬件驱动和通信协议（由RML Adapter屏蔽）
+
+### 1.4 平台使用角色
+
+RobotClaw作为开放平台，围绕四类核心角色构建生态：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     RobotClaw 平台                               │
+│                                                                   │
+│  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐    │
+│  │  代理商    │  │ 本体提供商 │  │ 模型提供商 │  │ Skill开发者│    │
+│  │ (Agent)   │  │ (OEM)     │  │ (Model)   │  │ (SkillDev) │    │
+│  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘    │
+│        │              │              │              │            │
+│        ▼              ▼              ▼              ▼            │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐        │
+│  │场景模板   │  │e-URDF    │  │Provider  │  │Skill     │        │
+│  │SOP编排   │  │能力声明   │  │模型注册   │  │ClawHub   │        │
+│  │参数配置   │  │硬件适配   │  │推理服务   │  │交易结算   │        │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────┘        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 1.4.1 代理商（Agent / 集成商）
+
+**定位：** 面向终端客户的方案交付者，利用平台能力开发场景模板，满足客户业务需求。
+
+| 维度 | 说明 |
+|------|------|
+| **核心工作** | 理解客户业务SOP → 选择/组合Skill → 配置场景模板 → 部署交付 |
+| **使用的平台能力** | SOP Compiler、场景模板系统、Dashboard、Skill Registry（选型）、记忆管理 |
+| **产出** | 场景模板（含SOP、Skill组合、参数配置、失败处理方案） |
+| **典型用户** | 机器人集成商、行业解决方案商、系统集成SI |
+| **价值主张** | 从"80人月写代码"变为"配置模板+少量定制"，首个项目10人月以内 |
+
+**代理商工作流：**
+
+```
+客户需求（业务SOP）
+    │
+    ├── 1. 从模板库选择最接近的场景模板
+    ├── 2. 配置模板参数（点位、阈值、告警规则等）
+    ├── 3. 从Skill Registry选择/购买所需Skill
+    ├── 4. 补充定制Skill（如有）
+    ├── 5. 联调验证（Dashboard监控+参数微调）
+    └── 6. 交付客户，持续运维
+```
+
+#### 1.4.2 机器人本体提供商（OEM）
+
+**定位：** 提供机器人硬件及其e-URDF能力描述，使机器人能够被平台识别和调度。
+
+| 维度 | 说明 |
+|------|------|
+| **核心工作** | 定义e-URDF（能力声明+物理约束） → 实现RML Adapter → 验证Skill兼容性 |
+| **使用的平台能力** | e-URDF定义工具、Forge机器人接入、Skill兼容性验证、能力抽象层 |
+| **产出** | e-URDF文件、RML Adapter实现、Skill兼容性报告 |
+| **典型用户** | 宇树科技、优必选、大疆、UR（优傲）、自研机器人团队 |
+| **价值主张** | 一次接入，即可复用平台全部Skill和场景模板（Teach Once, Embody Anywhere） |
+
+**本体接入流程：**
+
+```
+机器人硬件
+    │
+    ├── 1. 编写e-URDF（声明能力、物理约束、传感器参数）
+    ├── 2. 实现RML Adapter（对接ROS2/DDS/自定义协议）
+    ├── 3. 能力校验（平台自动校验e-URDF与Skill需求的匹配度）
+    ├── 4. Skill兼容性测试（在目标Skill上运行验证）
+    └── 5. 发布至平台，供代理商选用
+```
+
+#### 1.4.3 模型提供商（Model Provider）
+
+**定位：** 提供AI模型能力（视觉、语音、决策等），通过Provider接口注册到平台，供Skill调用。
+
+| 维度 | 说明 |
+|------|------|
+| **核心工作** | 封装模型为Provider接口 → 注册能力声明 → 提供推理服务（远端API或边缘模型包） |
+| **使用的平台能力** | Provider Registry、Provider抽象接口、边缘模型分发管线、模型版本管理 |
+| **产出** | Provider实现（远端API或边缘模型包）、能力声明、性能基线 |
+| **典型用户** | AI模型公司、视觉算法团队、大模型厂商（通义千问、智谱等）、垂直领域算法供应商 |
+| **价值主张** | 模型能力标准化接入，一次封装即可被多个场景多个Skill复用 |
+
+**模型提供方式：**
+
+| 部署位置 | 提供形式 | 适用场景 |
+|---------|---------|---------|
+| **远端** | API服务（HTTP/gRPC） | 大模型推理（SOP编译、复杂决策、VLM分析） |
+| **边缘** | ONNX模型包 + 平台自动编译为目标芯片格式 | 实时推理（目标检测、ASR、TTS、异常识别） |
+| **混合** | 远端API + 边缘蒸馏版 | 高可用场景（边缘优先，远端兜底） |
+
+#### 1.4.4 Skill开发者（Skill Developer）
+
+**定位：** 开发可复用的Skill，通过ClawHub市场上架交易，获取收益。
+
+| 维度 | 说明 |
+|------|------|
+| **核心工作** | 开发Skill（接口定义+执行逻辑） → 声明能力需求 → 测试验证 → 上架ClawHub |
+| **使用的平台能力** | Skill接口标准、ClawHub技能市场、Darwin评测体系、Forge测试环境 |
+| **产出** | Skill实现（含接口定义、前后置条件、失败模式、恢复策略） |
+| **典型用户** | 机器人算法工程师、ROS2开发者、垂直行业技术团队、独立开发者 |
+| **价值主张** | 开发一次，多场景多本体复用；通过ClawHub交易获取收益 |
+
+**Skill上架与交易流程：**
+
+```
+Skill开发
+    │
+    ├── 1. 按Skill接口标准开发（输入/输出/前后置条件/失败模式/恢复策略）
+    ├── 2. 声明所需能力（required_capabilities）和适用本体
+    ├── 3. 本地测试 + Darwin评测（六道关卡）
+    ├── 4. 上架ClawHub（版本管理、能力标签、适用场景标注）
+    ├── 5. 代理商/集成商购买使用
+    └── 6. 按调用量/订阅结算收益
+```
+
+**Skill交易模式：**
+
+| 模式 | 说明 | 适用场景 |
+|------|------|---------|
+| **按次付费** | 每次Skill调用计费 | 低频使用的专业Skill |
+| **订阅制** | 按月/年订阅，不限调用次数 | 高频使用的基础Skill |
+| **买断制** | 一次性购买，永久使用 | 核心Skill、大客户定制 |
+| **开源免费** | 社区贡献，免费使用 | 基础通用Skill，扩大生态 |
+
+#### 1.4.5 角色协作关系
+
+```
+                    终端客户（医院、电厂、矿山...）
+                              │
+                              │ 业务需求
+                              ▼
+                    ┌──────────────────┐
+                    │     代理商        │ ← 选择场景模板 + 配置参数
+                    │  (方案交付)       │ ← 选购Skill组合
+                    └────────┬─────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              ▼              ▼              ▼
+    ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+    │ 本体提供商    │ │ 模型提供商    │ │ Skill开发者   │
+    │              │ │              │ │              │
+    │ 提供机器人    │ │ 提供AI模型    │ │ 提供Skill     │
+    │ + e-URDF     │ │ + Provider   │ │ + ClawHub    │
+    └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
+           │                │                │
+           └────────────────┼────────────────┘
+                            ▼
+                  ┌──────────────────┐
+                  │  RobotClaw 平台   │
+                  │                   │
+                  │ SOP Compiler      │
+                  │ 执行引擎          │
+                  │ 记忆系统          │
+                  │ 数据飞轮          │
+                  └──────────────────┘
+```
+
+**平台在角色间的价值：**
+
+| 角色对 | 平台提供的连接价值 |
+|--------|------------------|
+| 代理商 ↔ 本体提供商 | e-URDF标准化机器人能力，代理商无需关心硬件差异 |
+| 代理商 ↔ Skill开发者 | ClawHub市场提供Skill发现、评测、交易的标准化流程 |
+| 代理商 ↔ 模型提供商 | Provider接口屏蔽模型差异，代理商只关心能力而非模型实现 |
+| 本体提供商 ↔ Skill开发者 | 能力抽象层实现"Skill写一次，多本体运行"，双方独立演进 |
+| 模型提供商 ↔ Skill开发者 | Provider接口解耦模型与Skill，模型升级不影响Skill逻辑 |
 
 ---
 
@@ -722,6 +895,31 @@ capability:
   data_topic: "/audio/mic/raw"
 ```
 
+```yaml
+capability:
+  name: "pushing"
+  type: "manipulation.pushing"
+
+  hardware:
+    actuators:
+      - name: "door_pusher"
+        type: "linear_actuator"
+        stroke_mm: 300
+        max_force_n: 50
+        speed_mm_s: 100
+        mount_frame: "front_link"
+
+  constraints:
+    max_safe_force_n: 50           # 安全力上限
+    force_control_hz: 100          # 力控频率
+    collision_detection_n: 30      # 碰撞检测阈值
+    position_accuracy_mm: 5        # 定位精度
+
+  status_topic: "/actuators/pusher/status"
+  command_topic: "/actuators/pusher/command"
+  force_topic: "/actuators/pusher/force"
+```
+
 ### 3.3 能力抽象层在系统中的位置
 
 ```
@@ -756,15 +954,23 @@ capability:
 
 Skill是面向任务的高级操作，Capability是面向硬件的原子能力。一个Skill通常需要多个Capability组合：
 
-| Skill | 所需Capability组合 |
-|-------|-------------------|
-| navigate_to_waypoint | walking + localization |
-| capture_thermal_image | vision(thermal) + localization |
-| detect_anomaly | vision(rgb) + environment |
-| alert_operator | speaking + network |
-| verbal_interaction | hearing + speaking |
-| force_guided_insert | grasping + force_sensing + vision |
-| patrol_and_report | walking + vision + hearing + speaking + network |
+| Skill | 所需Capability组合 | 适用场景 |
+|-------|-------------------|---------|
+| navigate_to_waypoint | walking/wheeling + localization | 送药/巡检 |
+| speak_text | speaking | 送药/巡检 |
+| wait_for_weight_change | force_sensing | 送药 |
+| check_weight | force_sensing | 送药 |
+| detect_target | vision(rgb) + localization | 送药（门/床位） |
+| open_door | manipulation.pushing + vision + force_sensing | 送药 |
+| wait_for_condition | vision / force_sensing（按条件类型） | 送药 |
+| capture_thermal_image | vision(thermal) + localization | 巡检 |
+| detect_anomaly | vision(rgb) + environment | 巡检 |
+| alert_operator | speaking + network | 送药/巡检 |
+| return_to_base | walking/wheeling + localization | 巡检 |
+| log_result | network | 送药/巡检 |
+| verbal_interaction | hearing + speaking | 送药（扩展） |
+| force_guided_insert | grasping + force_sensing + vision | 通用 |
+| patrol_and_report | walking + vision + hearing + speaking + network | 巡检 |
 
 Skill接口声明中的`required_sensors`字段升级为**required_capabilities**：
 
@@ -865,6 +1071,39 @@ SOP步骤: "到3号设备前，用红外相机拍摄设备温度分布图，如�
   步骤4: alert_operator(method="network") -- 降级：无speaking，使用network文字告警
 ```
 
+**送药场景能力画像与编译示例：**
+
+```
+SOP步骤: "到药房取药，送到301病房张三，开门进入，确认取药后返回护士站"
+
+能力分析:
+  ├── "到药房"          → 需要 locomotion.* (任一移动能力)
+  ├── "取药/感知药品"    → 需要 perception.force_sensing (药箱力传感器)
+  ├── "开门进入"         → 需要 manipulation.pushing + perception.vision
+  ├── "识别床位"         → 需要 perception.vision (RGB相机)
+  ├── "语音播报"         → 需要 communication.speaking
+  └── "返回护士站"       → 需要 locomotion.* + perception.localization
+
+目标机器人: 定制送药机器人
+能力画像:
+  ✓ locomotion.wheeling (轮式差速, max 0.8m/s)
+  ✓ perception.vision (RGB)
+  ✓ perception.force_sensing (药箱力传感器)
+  ✓ manipulation.pushing (推杆, max 50N)
+  ✓ communication.speaking (扬声器)
+  ✓ perception.localization (激光雷达+IMU)
+  ✗ perception.hearing (无麦克风)
+
+编译结果:
+  步骤1: navigate_to_waypoint(target="pharmacy") -- 使用wheeling能力
+  步骤2: speak_text(text="请取301病房张三的药品") -- 使用speaking能力
+  步骤3: wait_for_weight_change(direction="increase") -- 使用force_sensing能力
+  步骤4: navigate_to_waypoint(target="room_301_door") -- 使用wheeling能力
+  步骤5: open_door(target="room_301_door", type="push") -- 使用pushing+vision+force_sensing
+  步骤6: detect_target(target="bed_3") -- 使用vision能力
+  步骤7-N: ... (后续类推)
+```
+
 ### 3.7 e-URDF中的能力声明
 
 能力声明作为e-URDF扩展的核心部分：
@@ -909,6 +1148,64 @@ SOP步骤: "到3号设备前，用红外相机拍摄设备温度分布图，如�
                       reason="no_manipulator"/>
     <eurdf:capability type="communication.speaking" available="false"
                       reason="no_speaker"/>
+  </eurdf:capabilities>
+</eurdf:extensions>
+```
+
+**送药机器人e-URDF能力声明示例（MVP首要验证机器人）：**
+
+```xml
+<eurdf:extensions>
+  <eurdf:robot_type>medication_delivery</eurdf:robot_type>
+  <eurdf:chassis>wheeled</eurdf:chassis>
+
+  <eurdf:capabilities>
+    <eurdf:capability type="locomotion.wheeling">
+      <eurdf:actuator_group name="diff_drive" joints="2"
+                            max_speed="0.8" min_turn_radius="0.0"/>
+      <eurdf:constraint terrain="flat,indoor" max_slope="5"/>
+    </eurdf:capability>
+
+    <eurdf:capability type="perception.vision">
+      <eurdf:sensor name="front_rgb_camera" type="rgb_camera"
+                    resolution="1920x1080" fps="30" fov_h="69.4"
+                    mount_frame="body_link"/>
+    </eurdf:capability>
+
+    <eurdf:capability type="perception.force_sensing">
+      <eurdf:sensor name="medicine_box_scale" type="load_cell"
+                    location="medicine_box" range_force="0,5000"
+                    resolution_g="1" frequency="100"/>
+    </eurdf:capability>
+
+    <eurdf:capability type="manipulation.pushing">
+      <eurdf:actuator name="door_pusher" type="linear_actuator"
+                      max_force_n="50" stroke_mm="300"
+                      mount_frame="front_link"/>
+      <eurdf:constraint max_safe_force_n="50"
+                        force_control_hz="100"/>
+    </eurdf:capability>
+
+    <eurdf:capability type="communication.speaking">
+      <eurdf:actuator name="speaker" type="audio_output"
+                      channels="1" max_volume_db="85"/>
+    </eurdf:capability>
+
+    <eurdf:capability type="perception.localization">
+      <eurdf:sensor name="lidar" type="2d_lidar"
+                    range="12.0" frequency="10" mount_frame="body_link"/>
+      <eurdf:sensor name="imu" type="imu" frequency="200"/>
+    </eurdf:capability>
+
+    <eurdf:capability type="communication.network">
+      <eurdf:interface name="wifi" type="wifi" band="5GHz"/>
+    </eurdf:capability>
+
+    <!-- 未具备的能力 -->
+    <eurdf:capability type="perception.hearing" available="false"
+                      reason="no_microphone"/>
+    <eurdf:capability type="locomotion.walking" available="false"
+                      reason="wheeled_chassis"/>
   </eurdf:capabilities>
 </eurdf:extensions>
 ```
@@ -1266,9 +1563,9 @@ SOP自然语言文本
 - 场景模板版本变更（模板Skill组合或参数模板更新）
 ```
 
-### 4.3 完整示例：医院护士送药流程
+### 4.3 MVP场景一：医院护士送药流程（首要验证场景）
 
-以下以医院护士送药场景为例，完整展示SOP从输入到DAG执行的全链路分解。
+以下以医院护士送药场景为MVP首要验证目标，完整展示SOP从输入到DAG执行的全链路分解。该场景使用定制送药机器人（轮式底盘+药箱+推杆/机械臂），单楼层运行，涵盖导航、语音交互、力感知、视觉识别、物理开门等核心能力。
 
 #### 4.3.1 原始SOP输入
 
@@ -1280,7 +1577,7 @@ SOP自然语言文本
 3. 向药剂师语音确认："药品已接收，正在配送至301病房"
 4. 导航至301病房门口
 5. 到达后语音播报："301病房送药服务，请开门"
-6. 等待门打开（超时60秒未开门则呼叫护士站）
+6. 推开病房门进入（门锁定时呼叫护士站）
 7. 进入病房，识别患者张三的床位（3号床）
 8. 导航至3号床旁
 9. 语音播报："张三您好，这是您本次的药品，请核对"
@@ -1336,12 +1633,12 @@ SOP自然语言文本
     },
     {
       "step_id": 6,
-      "action": "等待门打开",
+      "action": "推开病房门进入",
       "target": "room_301_door",
-      "condition": "门状态 == 打开",
-      "params": {"timeout_s": 60},
+      "condition": "门未锁定",
+      "params": {"door_type": "push"},
       "depends_on": [5],
-      "on_timeout": "呼叫护士站"
+      "on_failure": "呼叫护士站"
     },
     {
       "step_id": 7,
@@ -1413,7 +1710,7 @@ SOP自然语言文本
 | 3 | 语音确认 | speak_text | 0.98 | speaking |
 | 4 | 导航至301病房 | navigate_to_waypoint | 0.97 | walking + localization |
 | 5 | 语音播报到达 | speak_text | 0.98 | speaking |
-| 6 | 等待门打开 | wait_for_condition | 0.88 | vision |
+| 6 | 推开病房门进入 | open_door | 0.93 | manipulation.pushing + vision + force_sensing |
 | 7 | 识别床位 | detect_target | 0.90 | vision |
 | 8 | 导航至床旁 | navigate_to_waypoint | 0.97 | walking + localization |
 | 9 | 语音播报 | speak_text | 0.98 | speaking |
@@ -1488,16 +1785,16 @@ dag:
         repeat_interval_s: 10
       depends_on: ["n5_nav_room"]
 
-    - id: "n7_wait_door"
-      skill: "wait_for_condition"
+    - id: "n7_open_door"
+      skill: "open_door"
       params:
-        condition_type: "door_open"
-        target: "room_301_door"
-        detection_method: "vision"
-        timeout_s: 60
+        target_door: "room_301_door"
+        door_type: "push"
       failure_modes:
-        - code: "TIMEOUT"
-          recovery: "invoke_skill('alert_operator', {target: 'nurse_station', reason: '301病房无人开门'})"
+        - code: "HANDLE_NOT_FOUND"
+          recovery: "retry_after(2, max=3)"
+        - code: "DOOR_LOCKED"
+          recovery: "invoke_skill('alert_operator', {target: 'nurse_station', reason: '301病房门锁定，请开门'})"
       depends_on: ["n6_announce_arrival"]
 
     # Phase 3: 病房内送药
@@ -1507,7 +1804,7 @@ dag:
         target_type: "hospital_bed"
         target_label: "3号床"
         detection_model: "hospital_furniture_v2"
-      depends_on: ["n7_wait_door"]
+      depends_on: ["n7_open_door"]
 
     - id: "n9_nav_bedside"
       skill: "navigate_to_waypoint"
@@ -1600,7 +1897,7 @@ dag:
   [n1 导航药房] → [n2 语音取药] → [n3 等待放药(力)] → [n4 语音确认]
                                                           │
                                                           ▼
-  [n7 等待开门(视)] ← [n6 语音到达] ← [n5 导航301病房]
+  [n7 开门进入(力+视)] ← [n6 语音到达] ← [n5 导航301病房]
         │
         ▼
   [n8 识别床位(视)] → [n9 导航床旁] → [n10 语音送药]
@@ -1636,14 +1933,15 @@ dag:
 
 | 原子能力 | 使用节点 | 必需/可选 | 降级方案 |
 |---------|---------|----------|---------|
-| locomotion.walking | n1,n5,n9,n13 | 必需 | 无（核心功能） |
+| locomotion.wheeling | n1,n5,n9,n13 | 必需 | 无（核心功能） |
 | perception.localization | n1,n5,n9,n13 | 必需 | 无 |
 | communication.speaking | n2,n4,n6,n10,n12a,n14 | 必需 | 降级为屏幕显示文字 |
-| perception.force_sensing | n3,n11,n12 | 必需 | 降级为视觉确认（精度下降） |
+| perception.force_sensing | n3,n7,n11,n12 | 必需 | 降级为视觉确认（精度下降） |
 | perception.vision | n7,n8 | 必需 | 降级为固定坐标（需预配置） |
+| manipulation.pushing | n7 | 必需 | 降级为语音通知人工开门 |
 | communication.network | n15 | 必需 | 本地缓存，网络恢复后上报 |
 
-**最低机器人配置：** 轮式/腿式移动底盘 + 扬声器 + 药箱力传感器 + RGB相机 + 定位系统 + WiFi
+**最低机器人配置：** 轮式移动底盘 + 扬声器 + 药箱力传感器 + RGB相机 + 推杆/机械臂（开门） + 定位系统 + WiFi
 
 #### 4.3.7 记忆系统对该流程的优化
 
@@ -1658,6 +1956,89 @@ dag:
 | **Spatial Memory** | 记住电梯等待时间规律 | 高峰期自动选择楼梯 |
 | | 记住301病房门朝向 | 到达后自动转向面对门 |
 | | 记住3号床精确位置 | 跳过视觉识别直接导航（置信度高时） |
+| | 记住门把手精确位置和开门力度 | 开门成功率从85%提升至98% |
+
+#### 4.3.8 开门Skill设计（open_door）
+
+送药场景的核心差异化Skill。机器人需要物理操作门把手并推/拉开病房门。
+
+**Skill接口定义：**
+
+```yaml
+skill:
+  name: "open_door"
+  version: "1.0.0"
+  description: "物理操作门把手开门，支持推门和拉门"
+
+  required_capabilities:
+    - type: "manipulation.pushing"
+      min_force_n: 30              # 最低推力
+    - type: "perception.vision"
+      sensor_type: "rgb_camera"    # 视觉定位门把手
+    - type: "perception.force_sensing"
+      sensitivity_n: 0.5           # 力控精度
+
+  inputs:
+    target_door:
+      type: "string"
+      description: "目标门标识（如 room_301_door）"
+    door_type:
+      type: "enum"
+      values: ["push", "pull", "sliding"]
+      default: "push"
+      description: "门的开启方式"
+
+  outputs:
+    success:
+      type: "bool"
+    door_angle_deg:
+      type: "float"
+      description: "门打开角度"
+    force_applied_n:
+      type: "float"
+      description: "实际施加力度"
+
+  preconditions:
+    - "robot.position.distance_to(target_door) < 1.0"
+    - "robot.capability('manipulation.pushing').status == 'ready'"
+
+  postconditions:
+    - "door.state == 'open'"
+    - "door.angle >= 60"           # 至少开60度供机器人通过
+
+  failure_modes:
+    - code: "HANDLE_NOT_FOUND"
+      description: "视觉未能定位到门把手"
+      recovery: "retry_after(2, max=3)"
+    - code: "DOOR_LOCKED"
+      description: "门被锁定，施力后无法打开"
+      recovery: "escalate_to_human({reason: '病房门锁定，请开门'})"
+    - code: "FORCE_EXCEEDED"
+      description: "施力超过安全阈值仍未打开"
+      recovery: "abort_dag({reason: '开门力度异常，可能被卡住'})"
+    - code: "DOOR_TYPE_MISMATCH"
+      description: "实际门类型与预期不匹配"
+      recovery: "invoke_skill('open_door', {door_type: detected_type})"
+
+  execution_steps:
+    1_approach: "导航至门前0.5m，正对门面"
+    2_detect_handle: "视觉检测门把手位置和类型（推/拉/滑动）"
+    3_reach: "机械臂/推杆伸出到门把手位置"
+    4_grip_or_push: "根据门类型执行：推门直接推、拉门先握把手再拉"
+    5_force_control: "力控模式开门，监控力度不超过安全阈值（50N）"
+    6_verify: "视觉确认门已打开至目标角度"
+    7_retract: "收回机械臂/推杆"
+```
+
+**力控安全策略：**
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| 最大推力 | 50N | 超过则停止并告警 |
+| 力控频率 | 100Hz | 力传感器采样率 |
+| 碰撞检测阈值 | 30N突增 | 0.1s内力变化>30N视为碰撞 |
+| 门把手定位精度 | ±2cm | 视觉+力反馈联合定位 |
+| 开门超时 | 15s | 超时未打开则触发恢复策略 |
 
 ### 4.4 执行引擎设计
 
@@ -2572,7 +2953,7 @@ practice:
 |---------|---------|---------|---------|------|
 | **SOP编译** | 远端 | 秒级（可容忍） | 大（>7B参数） | 离线编译，不要求实时；需要强推理能力 |
 | **执行决策** | 远端（复杂）/ 边缘（简单） | 100ms-1s | 大/小 | 复杂决策走远端，简单条件判断走边缘规则引擎 |
-| **目标检测** | **边缘** | <50ms | 小（<100MB） | 导航和巡检中持续运行，必须低延迟 |
+| **目标检测** | **边缘** | <50ms | 小（<100MB） | 导航、巡检、送药（门/床位/门把手检测）中持续运行，必须低延迟 |
 | **异常识别** | **边缘** | <100ms | 小（<200MB） | 检测到温度/外观异常需实时响应 |
 | **语音ASR** | **边缘** | <200ms | 小（Whisper tiny/small） | 人机交互实时性要求高，网络不可依赖 |
 | **语音TTS** | **边缘** | <100ms | 小（<100MB） | 即时语音播报，不能等网络往返 |
@@ -2927,6 +3308,82 @@ scene_template:
 
   # 适用机器人
   compatible_robots: ["unitree-go2", "unitree-g1"]
+```
+
+**医院送药模板（MVP首要验证模板）：**
+
+```yaml
+scene_template:
+  name: "医院送药"
+  version: "1.0.0"
+  category: "hospital_medication_delivery"
+
+  # 预配置SOP
+  default_sop: |
+    1. 到药房窗口，语音播报取药请求
+    2. 等待药品放入药箱，力传感器确认
+    3. 语音确认药品已接收
+    4. 导航至目标病房门口
+    5. 语音播报到达通知
+    6. 推开病房门进入
+    7. 识别目标床位
+    8. 导航至床旁，语音播报送药信息
+    9. 等待患者取药，力传感器确认
+    10. 检查药品是否全部取出
+    11. 语音播报送药完成
+    12. 导航返回护士站
+    13. 语音上报送药结果
+
+  # 已验证的Skill组合
+  required_skills:
+    - navigate_to_waypoint
+    - speak_text
+    - wait_for_weight_change
+    - detect_target
+    - open_door
+    - check_weight
+    - alert_operator
+    - log_result
+
+  # 可配置参数
+  configurable_params:
+    pharmacy_location:
+      type: "Pose3D"
+      description: "药房窗口位置"
+    nurse_station_location:
+      type: "Pose3D"
+      description: "护士站位置"
+    room_locations:
+      type: "map[string, Pose3D]"
+      description: "病房位置映射（如 room_301 → 坐标）"
+    bed_locations:
+      type: "map[string, Pose3D]"
+      description: "床位位置映射（可选，有Spatial Memory后自动学习）"
+    weight_threshold_g:
+      type: "float"
+      default: 10.0
+      description: "药箱重量变化检测阈值(克)"
+    door_type:
+      type: "enum"
+      values: ["push", "pull", "sliding"]
+      default: "push"
+      description: "病房门类型"
+    delivery_speed:
+      type: "float"
+      default: 0.6
+      range: [0.3, 0.8]
+      description: "送药导航速度(m/s)"
+
+  # 典型失败处理方案
+  failure_handling:
+    door_locked: "语音通知护士站开门，等待60秒"
+    navigation_blocked: "尝试绕行，3次失败后通知护士站"
+    medicine_not_loaded: "超时120秒未放药，通知药房"
+    medicine_not_picked: "语音重复提醒，超时120秒通知护士站"
+    door_handle_not_found: "重试3次，失败后通知护士站开门"
+
+  # 适用机器人
+  compatible_robots: ["custom-med-delivery-v1"]
 ```
 
 ### 11.3 模板使用流程
@@ -3421,19 +3878,20 @@ Docker Compose部署:
 
 **交付物：**
 1. SOP Compiler五步编译流水线
-2. e-URDF标准定义和解析器
-3. Skill接口标准 + 6个巡检核心Skill桩
+2. e-URDF标准定义和解析器（含送药机器人和巡检机器人示例）
+3. Skill接口标准 + 11个核心Skill桩（送药：导航、语音、力感知等待、重量检查、目标检测、开门、条件等待、告警、日志；巡检：热成像、异常检测、回基站。共享：导航、告警、日志）
 4. DAG Schema（顺序+条件分支）
 5. 执行引擎骨架（C++ + TensorRT，状态机+基础顺序执行+异常恢复）
-6. 边缘推理运行时（TensorRT后端 + 首批边缘模型）
+6. 边缘推理运行时（TensorRT后端 + 首批边缘模型，含门/床位/设备检测 + ASR + TTS）
 7. Practice记录基础（数据采集+存储）
 8. Task Memory（编译缓存）
-9. 电力巡检场景模板
+9. 医院送药场景模板（**首要**）+ 电力巡检场景模板
 10. Docker容器化部署（远端）+ C++原生部署（Jetson AGX Orin）
 
 **验证标准：**
-- 可演示"改SOP不改代码"完整流程：输入自然语言SOP → 编译为Skill DAG → 修改SOP → 自动更新执行计划 → 第二次编译缓存命中(0ms)
-- 边缘模型在Jetson AGX Orin上推理延迟达标（检测<20ms, ASR<100ms）
+- **送药场景（首要）：** 可演示护士送药全链路 —— 输入送药SOP → 编译为Skill DAG → 机器人执行：药房取药 → 导航 → 开门 → 识别床位 → 语音交互 → 力感知交接 → 返回上报
+- **巡检场景：** 可演示"改SOP不改代码"完整流程：输入自然语言SOP → 编译为Skill DAG → 修改SOP → 自动更新执行计划 → 第二次编译缓存命中(0ms)
+- 边缘模型在Jetson AGX Orin上推理延迟达标（检测<20ms, ASR<100ms, TTS<50ms）
 
 ### Phase 2 (Month 3-4): 引擎完善
 
@@ -3449,7 +3907,7 @@ Docker Compose部署:
 - 核心边缘模型在国产芯片上的精度对齐验证
 
 **验证标准：**
-- 同一巡检任务第10次执行比第1次快20%+
+- 同一送药/巡检任务第10次执行比第1次快20%+
 - 至少一款国产芯片上核心模型（检测+ASR）跑通，精度损失<2%
 
 ### Phase 3 (Month 5-6): 真机验证
@@ -3465,7 +3923,8 @@ Docker Compose部署:
 - 仿真环境集成（用于Skill验证、回归测试和Darwin评测，不替代真机验证）
 
 **验证标准：**
-- 真实巡检场景端到端跑通
+- 送药场景真机端到端跑通（送药客户优先验证）
+- 巡检场景真机端到端跑通
 - 国产芯片端到端性能达到Jetson基线的90%+
 
 ### Phase 4 (Month 7-9): 产品化
