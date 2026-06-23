@@ -1575,6 +1575,349 @@ SOP自然语言文本
 - 场景模板版本变更（模板Skill组合或参数模板更新）
 ```
 
+#### 4.2.4 SOP可执行性验证（Executability Check）
+
+SOP编译的核心挑战不仅是"把自然语言拆成Skill序列"，更是**在执行前就判定"这个SOP能否被这台机器人正确执行"**。这一验证贯穿SOP→Skill→Capability两级分解的全过程，是系统"可预测失败优于黑盒成功"设计原则的技术支撑。
+
+**验证总体流程：**
+
+```
+SOP自然语言
+    │
+    ▼
+┌─────────────────────────────────────────────────────┐
+│ 第一级验证：SOP → Skill 分解可行性                    │
+│                                                       │
+│  1. 步骤完整性检查 — 每个SOP步骤都能映射到Skill？      │
+│  2. 映射置信度检查 — 映射质量是否达标？                │
+│  3. Skill存在性检查 — 所需Skill是否在Registry中注册？  │
+│  4. 参数可绑定检查 — Skill所需参数能否从SOP上下文提取？│
+│  5. 数据流完整性检查 — 节点间数据引用是否有效？        │
+│  6. DAG结构合法性检查 — 无环路、无悬挂节点？           │
+└───────────────────────┬─────────────────────────────┘
+                        │ 通过
+                        ▼
+┌─────────────────────────────────────────────────────┐
+│ 第二级验证：Skill → Capability 匹配可行性             │
+│                                                       │
+│  1. 必需能力覆盖检查 — 每个Skill的required_capabilities│
+│     是否被目标机器人的能力画像覆盖？                   │
+│  2. 能力参数满足性检查 — 机器人的能力参数是否满足Skill │
+│     的最低要求？(如min_speed, min_force_n)            │
+│  3. 可选能力降级评估 — 缺失可选能力时，降级方案是否    │
+│     可接受？对任务成功率的影响多大？                   │
+│  4. 能力冲突检测 — DAG中并行节点是否竞争同一能力？     │
+│  5. 能力持续性检查 — 长时间任务中能力是否可持续？       │
+└───────────────────────┬─────────────────────────────┘
+                        │ 通过
+                        ▼
+┌─────────────────────────────────────────────────────┐
+│ 综合裁决：生成可执行性报告                             │
+│                                                       │
+│  EXECUTABLE      — 完全可执行，所有检查通过            │
+│  EXECUTABLE_DEGRADED — 可降级执行，列出降级项和影响    │
+│  NOT_EXECUTABLE  — 不可执行，列出阻断原因和建议        │
+└─────────────────────────────────────────────────────┘
+```
+
+##### 第一级验证：SOP → Skill 分解可行性
+
+**检查项1：步骤映射完整性**
+
+SOP中的每个自然语言步骤，必须在Stage 2意图映射后绑定到至少一个Skill。未映射步骤意味着系统不知道如何执行该操作。
+
+```
+检查逻辑:
+  FOR each step in SOP_steps:
+    IF step.mapped_skill == NULL:
+      report UNMAPPED_STEP(step_id, step.action)
+      verdict = NOT_EXECUTABLE
+
+判定:
+  - 存在任一UNMAPPED_STEP → 整体NOT_EXECUTABLE
+  - 处理方式: 提示用户该步骤需要开发新Skill或修改SOP表述
+```
+
+**检查项2：映射置信度**
+
+Stage 2中每个步骤到Skill的映射都带有置信度分数（由LLM推理 + embedding相似度计算）。低置信度意味着映射可能错误。
+
+```
+置信度分级:
+  高置信度  [0.9, 1.0]  → 自动通过
+  中置信度  [0.7, 0.9)  → 标记警告，可自动通过但在审核UI中高亮
+  低置信度  [0.5, 0.7)  → 需人工确认，不确认则阻断
+  极低置信度 [0, 0.5)   → 视为未映射，报UNMAPPED_STEP
+
+整体判定:
+  - 所有步骤 >= 0.7  → 自动通过（低于0.9的审核时高亮）
+  - 任一步骤 [0.5, 0.7) → 挂起等待人工确认
+  - 任一步骤 < 0.5 → NOT_EXECUTABLE
+```
+
+**检查项3：Skill存在性与版本**
+
+映射到的Skill名称必须在当前Skill Registry中存在且状态为active。
+
+```
+检查逻辑:
+  FOR each mapping in step_skill_mappings:
+    skill_info = SkillRegistry.lookup(mapping.skill_name)
+    IF skill_info == NULL:
+      report SKILL_NOT_FOUND(mapping.skill_name)
+    ELIF skill_info.status == "deprecated":
+      report SKILL_DEPRECATED(mapping.skill_name, skill_info.replacement)
+    ELIF skill_info.status == "experimental":
+      report SKILL_EXPERIMENTAL(mapping.skill_name)  // 警告但不阻断
+```
+
+**检查项4：参数可绑定性**
+
+Skill接口定义了所需的输入参数。SOP编译必须能从SOP上下文、场景模板参数或DAG上游节点输出中绑定这些参数。
+
+```
+检查逻辑:
+  FOR each node in DAG.nodes:
+    skill_def = SkillRegistry.get(node.skill)
+    FOR each required_param in skill_def.inputs WHERE required_param.required == true:
+      IF node.params[required_param.name] == UNBOUND:
+        // 检查是否可从上游节点输出推断
+        IF can_resolve_from_upstream(node, required_param):
+          auto_bind(node, required_param)  // 自动绑定上游输出
+        ELSE:
+          report PARAM_UNBOUND(node.id, required_param.name)
+
+判定:
+  - 存在任一required参数UNBOUND → NOT_EXECUTABLE
+  - 可选参数UNBOUND → 使用default值，记录INFO
+```
+
+**检查项5：数据流完整性**
+
+DAG节点间通过 `{ref: "n1.output.field"}` 语法引用数据。每个引用必须指向有效的上游节点和合法的输出字段。
+
+```
+检查逻辑:
+  FOR each node in DAG.nodes:
+    FOR each ref in node.params.all_references():
+      source_node = DAG.find_node(ref.node_id)
+      IF source_node == NULL:
+        report INVALID_REF_NODE(node.id, ref)
+      ELIF ref.field NOT IN source_node.skill.outputs:
+        report INVALID_REF_FIELD(node.id, ref)
+      ELIF NOT is_upstream(source_node, node):
+        report REF_NOT_UPSTREAM(node.id, ref)  // 引用了非上游节点，可能导致数据未就绪
+      ELIF NOT type_compatible(ref.field.type, expected_param.type):
+        report TYPE_MISMATCH(node.id, ref, expected=expected_param.type, actual=ref.field.type)
+```
+
+**检查项6：DAG结构合法性**
+
+```
+检查项:
+  1. 无环路检测 — 拓扑排序，检测是否存在环（Kahn算法或DFS标记）
+  2. 可达性检查 — 所有节点从起始节点可达
+  3. 悬挂节点检测 — 不存在无入边且非起始的节点
+  4. 条件分支完整性 — 每个conditional节点的所有分支都有合法子DAG
+  5. 分支隔离性 — 分支外节点不直接depends_on分支内节点（见4.1.3规则3）
+```
+
+##### 第二级验证：Skill → Capability 匹配可行性
+
+当DAG结构验证通过后，将DAG中所有涉及的Skill的能力需求汇总，与目标机器人的能力画像（Capability Profile）做匹配。
+
+**检查项1：必需能力覆盖**
+
+```
+检查逻辑:
+  // 汇总DAG全部能力需求
+  required_caps = {}
+  FOR each node in DAG.nodes:
+    skill_def = SkillRegistry.get(node.skill)
+    FOR each cap in skill_def.required_capabilities WHERE cap.optional == false:
+      required_caps.add(cap.type, node.id)
+
+  // 与机器人能力画像比对
+  robot_profile = CapabilityManager.get_robot_profile()
+  FOR each (cap_type, using_nodes) in required_caps:
+    robot_cap = robot_profile.lookup(cap_type)
+    IF robot_cap == NULL OR robot_cap.available == false:
+      report CAPABILITY_MISSING(cap_type, using_nodes, reason=robot_cap.reason)
+      verdict = NOT_EXECUTABLE
+
+示例输出:
+  ✗ CAPABILITY_MISSING: manipulation.grasping
+    需要该能力的节点: [n7_open_door]
+    原因: no_manipulator (e-URDF声明该机器人无机械臂)
+    建议: 1) 更换具备grasping能力的机器人
+          2) 修改SOP移除开门步骤（改为人工开门）
+          3) 使用替代Skill（如request_human_open_door）
+```
+
+**检查项2：能力参数满足性**
+
+即使机器人具备某项能力，其具体参数也需满足Skill的最低要求。
+
+```
+检查逻辑:
+  FOR each (cap_type, using_nodes) in required_caps:
+    skill_cap_req = get_capability_requirement(cap_type)  // Skill定义的最低要求
+    robot_cap = robot_profile.lookup(cap_type)
+
+    // 逐参数比对
+    IF skill_cap_req.min_speed AND robot_cap.max_speed < skill_cap_req.min_speed:
+      report CAPABILITY_INSUFFICIENT(cap_type, param="speed",
+             required=skill_cap_req.min_speed, actual=robot_cap.max_speed)
+
+    IF skill_cap_req.min_force_n AND robot_cap.max_force_n < skill_cap_req.min_force_n:
+      report CAPABILITY_INSUFFICIENT(cap_type, param="force",
+             required=skill_cap_req.min_force_n, actual=robot_cap.max_force_n)
+
+    IF skill_cap_req.sensor_type AND skill_cap_req.sensor_type NOT IN robot_cap.sensors:
+      report CAPABILITY_INSUFFICIENT(cap_type, param="sensor_type",
+             required=skill_cap_req.sensor_type, actual=robot_cap.sensors)
+
+示例输出:
+  ✗ CAPABILITY_INSUFFICIENT: locomotion.walking
+    参数: speed
+    Skill要求: min_speed >= 0.5 m/s
+    机器人实际: max_speed = 0.3 m/s
+    影响节点: [n1, n5, n9, n13]
+    建议: 调低Skill速度要求，或更换更快的移动底盘
+```
+
+**检查项3：可选能力降级评估**
+
+```
+检查逻辑:
+  FOR each node in DAG.nodes:
+    skill_def = SkillRegistry.get(node.skill)
+    FOR each cap in skill_def.required_capabilities WHERE cap.optional == true:
+      robot_cap = robot_profile.lookup(cap.type)
+      IF robot_cap == NULL OR robot_cap.available == false:
+        fallback = skill_def.capability_fallbacks.find(cap.type)
+        IF fallback:
+          report DEGRADATION(cap.type, node.id, fallback=fallback.action,
+                 impact="功能降级但可继续执行")
+        ELSE:
+          report DEGRADATION_NO_FALLBACK(cap.type, node.id,
+                 impact="可选能力缺失且无降级方案，该功能将被跳过")
+
+示例输出:
+  △ DEGRADATION: perception.hearing
+    影响节点: [n_verbal_interaction]
+    降级方案: skip_audio_monitoring (跳过语音监听)
+    影响: 无法接收患者语音反馈，改为等待固定时间
+    严重程度: LOW
+```
+
+**检查项4：能力冲突检测（Phase 2+，并行节点场景）**
+
+```
+检查逻辑:
+  FOR each parallel_group in DAG.parallel_nodes:
+    cap_usage = {}
+    FOR each node in parallel_group:
+      FOR each cap in node.required_capabilities WHERE cap.exclusive == true:
+        IF cap.type IN cap_usage:
+          report CAPABILITY_CONFLICT(cap.type, node.id, cap_usage[cap.type])
+        cap_usage[cap.type] = node.id
+
+示例:
+  ✗ CAPABILITY_CONFLICT: perception.vision
+    节点n3(capture_thermal_image)和n4(detect_target)同时需要独占相机
+    建议: 将并行改为顺序执行，或使用不同相机实例
+```
+
+**检查项5：能力持续性检查**
+
+对于长时间任务，验证能力在整个执行周期内是否可持续（如电池续航、存储空间、网络连接等）。
+
+```
+检查逻辑:
+  estimated_duration = DAG.estimate_total_duration()
+  FOR each cap_type in all_required_caps:
+    cap_endurance = robot_profile.get_endurance(cap_type)
+    IF cap_endurance < estimated_duration * 1.2:  // 20%余量
+      report ENDURANCE_WARNING(cap_type,
+             required=estimated_duration, available=cap_endurance)
+
+示例:
+  △ ENDURANCE_WARNING: locomotion.wheeling
+    DAG预估时长: 45分钟
+    电池续航(当前电量): 50分钟
+    余量不足20%，建议充电后执行或优化路径
+```
+
+##### 综合裁决与可执行性报告
+
+两级验证完成后，系统生成结构化的**可执行性报告（Executability Report）**：
+
+```yaml
+executability_report:
+  sop_id: "medication_delivery_301"
+  target_robot: "delivery-bot-001"
+  timestamp: "2026-06-20T10:30:00Z"
+
+  verdict: "EXECUTABLE_DEGRADED"   # EXECUTABLE | EXECUTABLE_DEGRADED | NOT_EXECUTABLE
+
+  # 第一级验证结果
+  skill_decomposition:
+    total_steps: 14
+    mapped_steps: 14
+    high_confidence: 12            # >= 0.9
+    medium_confidence: 2           # [0.7, 0.9)
+    low_confidence: 0              # < 0.7
+    unmapped: 0
+    dag_valid: true
+    data_flow_valid: true
+    status: "PASS"
+
+  # 第二级验证结果
+  capability_matching:
+    required_capabilities: 7
+    fully_met: 6
+    degraded: 1                    # 可选能力缺失但有降级方案
+    missing: 0                     # 必需能力缺失
+    insufficient: 0                # 参数不满足
+    conflicts: 0
+    status: "PASS_WITH_DEGRADATION"
+
+  # 降级明细
+  degradations:
+    - capability: "perception.hearing"
+      affected_nodes: ["n_verbal"]
+      fallback: "skip_audio_monitoring"
+      impact: "LOW"
+      description: "无麦克风，跳过语音监听，改为固定等待时间"
+
+  # 阻断项（verdict为NOT_EXECUTABLE时）
+  blockers: []
+
+  # 建议
+  recommendations:
+    - "为提升交互体验，建议加装麦克风阵列以支持语音交互"
+```
+
+**裁决逻辑：**
+
+```
+IF blockers为空 AND degradations为空:
+  verdict = EXECUTABLE
+ELIF blockers为空 AND degradations非空:
+  verdict = EXECUTABLE_DEGRADED
+  // 展示降级影响，由人工审核决定是否接受
+ELSE:
+  verdict = NOT_EXECUTABLE
+  // 展示所有阻断原因和建议，人工修改SOP或更换机器人后重新验证
+```
+
+**与编译管线的集成位置：**
+
+可执行性验证在编译管线Stage 4（静态校验）中执行。第一级验证在DAG构建（Stage 3）完成后立即运行；第二级验证在第一级通过后，结合目标机器人的能力画像运行。验证报告随DAG一起进入Stage 5人工审核，审核者可在可视化UI中看到每个节点的能力匹配状态和降级标注。
+
+验证结果也写入Task Memory缓存，当相同SOP+相同机器人能力画像再次编译时，可直接复用验证结论（缓存Key已包含机器人能力画像hash）。
+
 ### 4.3 MVP场景一：医院护士送药流程（首要验证场景）
 
 以下以医院护士送药场景为MVP首要验证目标，完整展示SOP从输入到DAG执行的全链路分解。该场景使用定制送药机器人（轮式底盘+药箱+推杆/机械臂），单楼层运行，涵盖导航、语音交互、力感知、视觉识别、物理开门等核心能力。
