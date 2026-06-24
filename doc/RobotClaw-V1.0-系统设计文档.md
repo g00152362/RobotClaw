@@ -1114,7 +1114,335 @@ SOP步骤: "到药房取药，送到301病房张三，开门进入，确认取�
   步骤7-N: ... (后续类推)
 ```
 
-### 3.7 e-URDF中的能力声明
+### 3.7 机器人能力画像模板库（Robot Profile Library）
+
+不同用户接入机器人时，从零配置能力画像成本高、容易出错。系统提供**预置能力画像模板库**，覆盖主流机器人型号，用户可以直接选用或基于模板派生定制。
+
+#### 3.7.1 预置模板（Platform Built-in）
+
+系统内置以下常见机器人的能力画像模板，由平台维护团队根据厂商公开参数编写并持续更新：
+
+```yaml
+robot_profile_library:
+  builtin_profiles:
+
+    # ─── 四足机器人 ───
+    - id: "unitree-go1"
+      name: "宇树 Go1"
+      manufacturer: "Unitree Robotics"
+      form_factor: "quadruped"
+      thumbnail: "assets/robots/unitree-go1.png"
+      capabilities:
+        locomotion.walking:
+          available: true
+          max_speed: 3.7          # m/s
+          gaits: ["trot", "crawl", "bound"]
+          payload_kg: 3.0
+        perception.vision:
+          available: true
+          sensors:
+            - {name: "front_stereo", type: "stereo_camera", resolution: "1280x720", fps: 30}
+            - {name: "face_camera", type: "rgb_camera", resolution: "1920x1080", fps: 30}
+        perception.localization:
+          available: true
+          method: ["visual_slam", "imu"]
+        communication.network:
+          available: true
+          interfaces: ["wifi", "ethernet"]
+        # 以下能力该机型不具备
+        manipulation.grasping: {available: false, reason: "no_manipulator"}
+        manipulation.pushing: {available: false, reason: "no_manipulator"}
+        perception.force_sensing: {available: false, reason: "no_force_sensor"}
+        communication.speaking: {available: false, reason: "no_speaker"}
+        perception.hearing: {available: false, reason: "no_microphone"}
+      benchmark:
+        battery_life_min: 60
+        weight_kg: 12.0
+        ip_rating: "IP54"
+
+    - id: "unitree-go2"
+      name: "宇树 Go2"
+      manufacturer: "Unitree Robotics"
+      form_factor: "quadruped"
+      inherits_from: "unitree-go1"      # 继承Go1基础能力，覆盖差异项
+      overrides:
+        locomotion.walking:
+          max_speed: 5.0
+          payload_kg: 5.0
+        perception.vision:
+          sensors:
+            - {name: "front_stereo", type: "stereo_camera", resolution: "1920x1080", fps: 30}
+            - {name: "lidar_3d", type: "lidar", range_m: 30, channels: 16}
+        perception.hearing:
+          available: true
+          sensors:
+            - {name: "mic_array", type: "microphone_array", channels: 4}
+        communication.speaking:
+          available: true
+          sensors:
+            - {name: "speaker", type: "speaker", power_w: 3}
+      benchmark:
+        battery_life_min: 120
+        weight_kg: 15.0
+
+    - id: "unitree-go2-pro"
+      name: "宇树 Go2 Pro（带机械臂）"
+      inherits_from: "unitree-go2"
+      overrides:
+        manipulation.grasping:
+          available: true
+          gripper_type: "parallel_jaw"
+          max_force_n: 40
+          reach_m: 0.5
+
+    # ─── 人形机器人 ───
+    - id: "unitree-g1"
+      name: "宇树 G1"
+      manufacturer: "Unitree Robotics"
+      form_factor: "humanoid"
+      capabilities:
+        locomotion.walking:
+          available: true
+          max_speed: 2.0
+          gaits: ["biped_walk", "biped_run"]
+          payload_kg: 3.0
+        manipulation.grasping:
+          available: true
+          hands: ["dexterous_left", "dexterous_right"]
+          dof_per_hand: 6
+          max_grip_force_n: 30
+        manipulation.pushing:
+          available: true
+          max_force_n: 80
+        perception.vision:
+          available: true
+          sensors:
+            - {name: "head_rgbd", type: "rgbd_camera", resolution: "1920x1080", fps: 30}
+            - {name: "chest_stereo", type: "stereo_camera", resolution: "1280x720", fps: 60}
+        perception.force_sensing:
+          available: true
+          sensors:
+            - {name: "left_wrist_ft", type: "force_torque_6dof"}
+            - {name: "right_wrist_ft", type: "force_torque_6dof"}
+        perception.localization:
+          available: true
+          method: ["lidar_slam", "visual_slam", "imu"]
+        perception.hearing:
+          available: true
+          sensors:
+            - {name: "mic_array", type: "microphone_array", channels: 6}
+        communication.speaking:
+          available: true
+          sensors:
+            - {name: "speaker", type: "speaker", power_w: 5}
+        communication.network:
+          available: true
+          interfaces: ["wifi_6", "5g", "ethernet"]
+      benchmark:
+        battery_life_min: 60
+        weight_kg: 35.0
+        height_m: 1.27
+
+    # ─── 轮式机器人 ───
+    - id: "custom-delivery-bot-v1"
+      name: "定制送药机器人 V1"
+      manufacturer: "custom"
+      form_factor: "wheeled"
+      description: "RobotClaw MVP送药场景定制机器人：轮式底盘+药箱+推杆"
+      capabilities:
+        locomotion.wheeling:
+          available: true
+          drive_type: "differential"
+          max_speed: 0.8
+          min_turn_radius: 0.0
+          payload_kg: 10.0
+        perception.vision:
+          available: true
+          sensors:
+            - {name: "front_rgb", type: "rgb_camera", resolution: "1920x1080", fps: 30}
+            - {name: "depth_camera", type: "rgbd_camera", resolution: "640x480", fps: 15}
+        perception.force_sensing:
+          available: true
+          sensors:
+            - {name: "tray_load_cell", type: "load_cell", range_kg: 10, resolution_g: 1}
+        perception.localization:
+          available: true
+          method: ["lidar_slam", "imu"]
+        manipulation.pushing:
+          available: true
+          actuator: "linear_pusher"
+          max_force_n: 50
+        communication.speaking:
+          available: true
+          sensors:
+            - {name: "speaker", type: "speaker", power_w: 5}
+        communication.network:
+          available: true
+          interfaces: ["wifi"]
+        perception.hearing: {available: false, reason: "no_microphone"}
+        manipulation.grasping: {available: false, reason: "no_gripper"}
+      benchmark:
+        battery_life_min: 240
+        weight_kg: 25.0
+
+    # ─── 巡检机器人 ───
+    - id: "custom-inspection-bot-v1"
+      name: "电力巡检机器人 V1"
+      manufacturer: "custom"
+      form_factor: "wheeled"
+      description: "变电站巡检场景定制机器人：轮式底盘+热成像+可见光"
+      capabilities:
+        locomotion.wheeling:
+          available: true
+          drive_type: "omnidirectional"
+          max_speed: 1.0
+          payload_kg: 15.0
+        perception.vision:
+          available: true
+          sensors:
+            - {name: "front_rgb", type: "rgb_camera", resolution: "1920x1080", fps: 30}
+            - {name: "thermal_cam", type: "thermal_camera", resolution: "640x480", fps: 15,
+               temperature_range: [-20, 350]}
+            - {name: "ptz_camera", type: "ptz_camera", resolution: "3840x2160", optical_zoom: 30}
+        perception.localization:
+          available: true
+          method: ["lidar_slam", "rtk_gps", "imu"]
+        perception.environment:
+          available: true
+          sensors:
+            - {name: "gas_detector", type: "gas_sensor", gases: ["SF6", "H2S"]}
+            - {name: "temp_humidity", type: "temp_humidity_sensor"}
+        communication.speaking:
+          available: true
+          sensors:
+            - {name: "speaker", type: "speaker", power_w: 10}
+        communication.network:
+          available: true
+          interfaces: ["wifi", "4g", "ethernet"]
+        perception.hearing:
+          available: true
+          sensors:
+            - {name: "mic", type: "microphone", note: "用于局放超声检测"}
+        manipulation.grasping: {available: false, reason: "no_manipulator"}
+        manipulation.pushing: {available: false, reason: "no_manipulator"}
+      benchmark:
+        battery_life_min: 480
+        weight_kg: 60.0
+        ip_rating: "IP65"
+```
+
+#### 3.7.2 用户自定义模板（User Profile Template）
+
+用户可以基于预置模板派生自己的机器人画像，也可以从零创建。保存后的画像作为**用户模板**存入用户空间，在SOP编译时可直接选用。
+
+```yaml
+user_profile_template:
+  id: "user-tpl-001"
+  name: "我院送药机器人（3楼定制版）"
+  owner: "hospital-301-agent"         # 所属代理商/用户
+  based_on: "custom-delivery-bot-v1"  # 基于哪个模板派生（可为空=从零创建）
+
+  overrides:                          # 相对父模板的差异
+    perception.force_sensing:
+      sensors:
+        - {name: "tray_load_cell", type: "load_cell", range_kg: 5, resolution_g: 0.5}  # 更精密的传感器
+    communication.speaking:
+      sensors:
+        - {name: "speaker", type: "speaker", power_w: 8}  # 更大功率扬声器
+
+  custom_fields:                      # 用户附加信息（不影响能力匹配，仅供展示/备注）
+    deployment_location: "XX医院3楼"
+    contact_person: "张工"
+    serial_number: "DLV-2026-0042"
+    notes: "3楼走廊较窄，需注意导航速度限制在0.5m/s以下"
+
+  created_at: "2026-06-20T10:00:00Z"
+  updated_at: "2026-06-23T14:30:00Z"
+  version: 3
+```
+
+**模板操作：**
+
+| 操作 | 说明 |
+|------|------|
+| **从预置模板派生** | 选择内置模板 → 修改差异项 → 保存为用户模板 |
+| **从零创建** | 向导式填写（见12.3节e-URDF定义工具）→ 保存为用户模板 |
+| **从URDF导入** | 上传厂商URDF文件 → 自动解析 → 补充e-URDF扩展字段 → 保存 |
+| **克隆** | 复制已有用户模板 → 修改 → 保存为新模板（适用于同型号多台机器人） |
+| **版本管理** | 每次修改生成新版本，支持回滚。版本变更自动触发关联Task Memory缓存失效 |
+
+#### 3.7.3 能力画像与SOP编译的绑定关系
+
+**SOP编译时，目标机器人（能力画像）是必选项。** 没有目标机器人，编译器无法做Skill→Capability匹配和降级决策。
+
+```
+SOP编译入口（Dashboard / API）:
+
+┌─────────────────────────────────────────────────────────┐
+│  新建编译任务                                             │
+│                                                           │
+│  SOP文本: [必填] ____________________________________    │
+│           │ 粘贴SOP文本 或 选择场景模板中的预置SOP     │    │
+│                                                           │
+│  目标机器人: [必选] ▼                                     │
+│           ┌──────────────────────────────────────────┐   │
+│           │ ★ 最近使用                                │   │
+│           │   ├── 我院送药机器人（3楼定制版）           │   │
+│           │   └── 巡检机器人-A区                       │   │
+│           │                                            │   │
+│           │ 📋 我的模板                                │   │
+│           │   ├── 我院送药机器人（3楼定制版）           │   │
+│           │   ├── 我院送药机器人（5楼标准版）           │   │
+│           │   └── 巡检机器人-A区                       │   │
+│           │                                            │   │
+│           │ 🏭 预置模板                                │   │
+│           │   ├── 宇树 Go1                            │   │
+│           │   ├── 宇树 Go2                            │   │
+│           │   ├── 宇树 Go2 Pro（带机械臂）             │   │
+│           │   ├── 宇树 G1                             │   │
+│           │   ├── 定制送药机器人 V1                    │   │
+│           │   └── 电力巡检机器人 V1                    │   │
+│           │                                            │   │
+│           │ ＋ 新建机器人画像...                        │   │
+│           └──────────────────────────────────────────┘   │
+│                                                           │
+│  场景模板: [可选] ▼ （选择后自动填充SOP文本和推荐参数）   │
+│                                                           │
+│        [ 开始编译 ]    [ 取消 ]                           │
+└─────────────────────────────────────────────────────────┘
+
+校验规则:
+  - SOP文本为空 → 禁用"开始编译"按钮
+  - 目标机器人未选择 → 禁用"开始编译"按钮，提示"请先选择目标机器人"
+  - 目标机器人选择后 → 右侧展示能力画像摘要卡片（见下方）
+```
+
+**选择机器人后的能力画像摘要卡片：**
+
+```
+┌─────────────────────────────────────────┐
+│  📦 宇树 Go2                     [编辑] │
+│  四足机器人 | Unitree Robotics           │
+│                                          │
+│  ✅ 行走 (max 5.0m/s)                   │
+│  ✅ 视觉 (RGB立体相机 + LiDAR)          │
+│  ✅ 定位 (LiDAR SLAM + IMU)             │
+│  ✅ 听觉 (4通道麦克风阵列)               │
+│  ✅ 语音 (扬声器 3W)                     │
+│  ✅ 网络 (WiFi + Ethernet)              │
+│  ❌ 抓取 (无机械臂)                      │
+│  ❌ 推拉 (无推杆)                        │
+│  ❌ 力觉 (无力传感器)                    │
+│                                          │
+│  🔋 续航120min | ⚖️ 15kg | 🛡️ IP54    │
+└─────────────────────────────────────────┘
+
+编译预判:
+  该机器人不支持 manipulation.pushing 和 perception.force_sensing，
+  涉及开门、称重的SOP步骤将标记为不可执行。
+```
+
+### 3.8 e-URDF中的能力声明
 
 能力声明作为e-URDF扩展的核心部分：
 
@@ -1478,11 +1806,16 @@ dag:
 #### 4.2.1 编译管线（5阶段）
 
 ```
-SOP自然语言文本
+编译输入（两个必选项）:
+  1. SOP自然语言文本              — 描述任务流程
+  2. 目标机器人能力画像            — 从画像库选择（预置模板/用户模板/在线机器人）
+     缺少任一输入，编译器拒绝启动。
+
+SOP自然语言文本 + 目标机器人能力画像
     │
     ▼
 [0. 缓存查询] ─── 命中 ──→ 直接返回已编译DAG（0ms）
-    │ 未命中
+    │ 未命中       缓存Key = SHA256(SOP文本 + Skill Registry版本 + 机器人能力画像hash)
     ▼
 [1. 步骤提取] LLM将SOP拆分为结构化步骤列表
     │           每步包含: 动作、目标、条件、参数
@@ -1490,21 +1823,21 @@ SOP自然语言文本
     ▼
 [2. 意图映射] 将每步动作映射到Skill Registry中的Skill
     │           方法: LLM推理 + Skill能力声明embedding匹配
+    │           输入: 步骤列表 + 目标机器人能力画像（用于能力感知映射）
     │           输出: 每步绑定一个Skill + 置信度分数
     ▼
 [3. DAG构建]  基于步骤间的数据依赖和控制依赖构建DAG
     │           Phase 1: 顺序 + 条件分支
     │           Phase 2: 增加并行和循环
     ▼
-[4. 静态校验] 自动检查:
-    │           - 所有引用的Skill在Registry中存在
-    │           - 输入/输出类型匹配
-    │           - 前置条件可满足
-    │           - DAG合法性（无环路）
-    │           - 数据引用有效性
+[4. 静态校验 + 可执行性验证]  自动检查:
+    │           - 第一级: SOP→Skill分解可行性（见4.2.4节）
+    │           - 第二级: Skill→Capability匹配可行性（基于目标机器人能力画像）
+    │           - 输出: 可执行性报告（EXECUTABLE / DEGRADED / NOT_EXECUTABLE）
     ▼
-[5. 人工审核] UI展示SOP原文 ↔ DAG映射
+[5. 人工审核] UI展示SOP原文 ↔ DAG映射 + 可执行性报告
     │           高亮低置信度映射（<0.8）
+    │           高亮能力缺失/降级项
     │           审核者确认或手动修正
     ▼
 最终Skill DAG → 写入Task Memory缓存
@@ -3925,8 +4258,28 @@ Dashboard（Web UI）
 │
 ├── 任务管理
 │   ├── 任务列表（全部/运行中/已完成/失败）
-│   ├── 任务创建（选择SOP/模板 → 编译 → 审核 → 下发）
+│   ├── 任务创建（选择SOP/模板 → 选择目标机器人[必选] → 编译 → 审核 → 下发）
 │   └── 任务详情（DAG可视化、执行进度、耗时统计）
+│
+├── 机器人管理
+│   ├── 机器人画像库（预置模板 + 用户自定义模板）
+│   │   ├── 预置模板浏览（宇树Go1/Go2/Go2 Pro/G1、定制送药机器人、巡检机器人等）
+│   │   ├── 从预置模板派生自定义画像
+│   │   ├── 从零创建画像（向导式表单）
+│   │   ├── 从URDF文件导入并转换
+│   │   └── 画像版本管理（历史版本、对比、回滚）
+│   ├── 能力画像详情
+│   │   ├── 能力清单展示（✅已具备 / ❌不具备 / 可选项标注）
+│   │   ├── 能力参数详情（速度、力矩、传感器分辨率等）
+│   │   ├── Benchmark指标（续航、载荷、防护等级）
+│   │   └── 关联Skill列表（该机器人可执行的Skill清单）
+│   ├── 在线机器人状态
+│   │   ├── 已注册机器人列表（在线/离线/故障）
+│   │   ├── 实时能力状态（各能力READY/BUSY/DEGRADED/FAULT）
+│   │   └── 机器人↔画像绑定关系
+│   └── 能力画像对比
+│       ├── 多机器人能力横向对比表
+│       └── SOP兼容性快速检查（选择SOP → 批量检查哪些机器人可执行）
 │
 ├── 实时监控
 │   ├── DAG执行进度（节点状态实时更新）
@@ -3944,7 +4297,10 @@ Dashboard（Web UI）
 │
 ├── SOP编译
 │   ├── SOP文本编辑器
+│   ├── 目标机器人选择（必选，从画像库选择或新建）
+│   ├── 编译前能力预判（基于选定机器人，高亮SOP中可能不可执行的步骤）
 │   ├── 编译结果预览（DAG可视化）
+│   ├── 可执行性报告展示（EXECUTABLE / DEGRADED / NOT_EXECUTABLE）
 │   ├── SOP原文 ↔ DAG映射对照
 │   ├── 低置信度映射高亮
 │   └── 一键确认/手动修正
